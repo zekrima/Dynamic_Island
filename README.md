@@ -11,8 +11,15 @@
 
 ---
 
-## Fitur Saat Ini (`v0.1.0`)
+## Fitur Saat Ini (`v0.2.0`)
 
+- **Unified 5-Tab Productivity Bar**: pindah cepat antara **`Media`**, **`Timer`**, **`Clip`**, **`Sys`**, dan **`Notifs`** langsung di dalam pill expanded (`440 × 162`).
+- **Focus / Pomodoro Timer (`Timer`)**
+  - Preset `5m`, `15m`, `25m`, `45m`, tombol `Start`/`Pause` & `Reset`, progress bar countdown, indikator hitung mundur aktif di collapsed pill, serta toast notifikasi otomatis saat waktu selesai.
+- **Quick Clipboard History (`Clip`)**
+  - Event-driven tanpa polling (`WM_CLIPBOARDUPDATE` di Windows, GTK4 `gdk::Clipboard` di Linux). Menyimpan potongan teks terbaru yang di-copy (`Ctrl+C`) — klik baris mana saja untuk copy ulang secara instan.
+- **Compact System Monitor (`Sys`)**
+  - Memantau **CPU %**, **RAM (Used / Total GB)**, dan **Battery / AC Power** dengan bar berkode warna; hanya di-sample saat tab `Sys` dibuka (`0.0%` idle CPU).
 - **Tampilan Jam Tegas & Jelas**
   - Jam **`HH:MM`** tebal dan mudah dibaca di mode collapsed pill (`16.5px` Bold), jam besar **`32px` Bold + tanggal** di mode expanded idle, serta jam **`18.5px` Bold** di pojok kanan kartu media.
 - **Equalizer Musik Mengikuti Irama Audio Asli (Real-Time FFT)**
@@ -78,10 +85,10 @@ Detail instalasi Hyprland / KDE Plasma 6 Wayland, autostart, & uninstall: [zekri
 
 Fitur-fitur produktivitas yang direncanakan untuk rilis berikutnya agar semakin membantu pekerjaan harian:
 
-- [ ] **Focus / Pomodoro Timer** — timer kerja langsung di pill dengan progress bar & pengingat selesai.
-- [ ] **Quick Clipboard & Scratchpad** — akses cepat riwayat clipboard & catatan singkat tanpa pindah jendela.
-- [ ] **System Monitor Ringkas** — indikator CPU, RAM, suhu, & jaringan saat expanded.
-- [ ] **Battery & Bluetooth Status** — notifikasi pengisian daya, baterai rendah, dan status perangkat audio Bluetooth.
+- [x] **Focus / Pomodoro Timer** — timer kerja langsung di pill dengan preset (`5m/15m/25m/45m`), progress bar, & toast selesai.
+- [x] **Quick Clipboard History** — akses cepat riwayat teks `Ctrl+C` (event-driven, klik untuk copy ulang instan).
+- [x] **System Monitor Ringkas** — indikator CPU, RAM, & Battery/Power berkode warna (on-demand, 0% idle CPU).
+- [ ] **Bluetooth Audio & Per-App Mixer** — status perangkat audio Bluetooth & kontrol volume per aplikasi.
 - [ ] **Calendar & Meeting Reminder** — hitung mundur jadwal meeting berikutnya langsung di collapsed pill.
 - [ ] **Kustomisasi Tema & Multi-Monitor** — pengaturan warna aksen, posisi monitor, dan file konfigurasi `config.toml`.
 - [ ] **Auto-Update & AUR Package** — paket AUR (`zekrima-bin` / `zekrima-git`) untuk Arch Linux & CachyOS.

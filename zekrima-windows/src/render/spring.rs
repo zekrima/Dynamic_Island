@@ -1,13 +1,8 @@
 //! Damped harmonic spring physics used by the island geometry.
-//!
-//! Every animated value owns its own spring. A spring reports whether it is
-//! still moving so the host window can stop its 16 ms timer as soon as the
-//! whole island has settled. When nothing is moving the application is
-//! completely idle: no timer, no repaint, 0.0% CPU.
 
 /// Collapsed geometry (logical pixels).
 pub const COLLAPSED_WIDTH: f32 = 178.0;
-pub const COLLAPSED_BADGE_WIDTH: f32 = 228.0;
+pub const COLLAPSED_BADGE_WIDTH: f32 = 232.0;
 pub const COLLAPSED_HEIGHT: f32 = 34.0;
 pub const COLLAPSED_RADIUS: f32 = 17.0;
 
@@ -21,19 +16,12 @@ pub const NOTIFICATION_WIDTH: f32 = 380.0;
 pub const NOTIFICATION_HEIGHT: f32 = 88.0;
 pub const NOTIFICATION_RADIUS: f32 = 26.0;
 
-/// Expanded media/idle geometry (logical pixels).
+/// Unified expanded geometry across all 5 tabs (`Media`, `Timer`, `Clip`, `Sys`, `Notifs`).
 pub const EXPANDED_WIDTH: f32 = 440.0;
-pub const EXPANDED_HEIGHT: f32 = 120.0;
+pub const EXPANDED_HEIGHT: f32 = 162.0;
 pub const EXPANDED_RADIUS: f32 = 28.0;
 
-/// Expanded notifications list geometry (logical pixels).
-pub const EXPANDED_NOTIFS_WIDTH: f32 = 440.0;
-pub const EXPANDED_NOTIFS_HEIGHT: f32 = 162.0;
-pub const EXPANDED_NOTIFS_RADIUS: f32 = 28.0;
-
-/// Distance below which a spring is considered to be at rest.
 const REST_DISTANCE: f32 = 0.05;
-/// Velocity below which a spring is considered to be at rest.
 const REST_VELOCITY: f32 = 0.05;
 
 #[derive(Debug, Clone, Copy)]
@@ -56,7 +44,6 @@ impl Spring {
         }
     }
 
-    /// Changes the target. Returns `true` when the target actually changed.
     pub fn set_target(&mut self, target: f32) -> bool {
         if self.target == target {
             false
@@ -66,7 +53,6 @@ impl Spring {
         }
     }
 
-    /// Advances the spring and returns `true` while it is still moving.
     pub fn update(&mut self, dt: f32) -> bool {
         let force = (self.target - self.current) * self.stiffness;
         let damping_force = self.velocity * self.damping;
@@ -74,7 +60,8 @@ impl Spring {
         self.velocity += (force - damping_force) * dt;
         self.current += self.velocity * dt;
 
-        if (self.target - self.current).abs() < REST_DISTANCE && self.velocity.abs() < REST_VELOCITY
+        if (self.target - self.current).abs() < REST_DISTANCE
+            && self.velocity.abs() < REST_VELOCITY
         {
             self.current = self.target;
             self.velocity = 0.0;
@@ -88,7 +75,6 @@ impl Spring {
         self.current
     }
 
-    /// `true` when the spring has reached its target and stopped moving.
     pub fn is_settled(&self) -> bool {
         self.current == self.target && self.velocity == 0.0
     }
@@ -101,10 +87,8 @@ pub enum PillMode {
     Hud,
     Notification,
     Expanded,
-    ExpandedNotifications,
 }
 
-/// The three animated dimensions of the pill.
 #[derive(Debug, Clone, Copy)]
 pub struct PillSprings {
     pub width: Spring,
@@ -121,7 +105,6 @@ impl PillSprings {
         }
     }
 
-    /// Sets the target geometry mode.
     pub fn set_mode(&mut self, mode: PillMode) -> bool {
         let (w, h, r) = match mode {
             PillMode::Collapsed => (COLLAPSED_WIDTH, COLLAPSED_HEIGHT, COLLAPSED_RADIUS),
@@ -131,11 +114,6 @@ impl PillSprings {
             PillMode::Hud => (HUD_WIDTH, HUD_HEIGHT, HUD_RADIUS),
             PillMode::Notification => (NOTIFICATION_WIDTH, NOTIFICATION_HEIGHT, NOTIFICATION_RADIUS),
             PillMode::Expanded => (EXPANDED_WIDTH, EXPANDED_HEIGHT, EXPANDED_RADIUS),
-            PillMode::ExpandedNotifications => (
-                EXPANDED_NOTIFS_WIDTH,
-                EXPANDED_NOTIFS_HEIGHT,
-                EXPANDED_NOTIFS_RADIUS,
-            ),
         };
         let width_changed = self.width.set_target(w);
         let height_changed = self.height.set_target(h);
@@ -143,16 +121,13 @@ impl PillSprings {
         width_changed || height_changed || radius_changed
     }
 
-    /// Advances every spring. Returns `true` while any spring is moving.
     pub fn update(&mut self, dt: f32) -> bool {
         let width_moving = self.width.update(dt);
         let height_moving = self.height.update(dt);
         let radius_moving = self.radius.update(dt);
-
         width_moving || height_moving || radius_moving
     }
 
-    /// Current `(width, height, corner_radius)` in logical pixels.
     pub fn geometry(&self) -> (f32, f32, f32) {
         (
             self.width.current(),
@@ -161,7 +136,6 @@ impl PillSprings {
         )
     }
 
-    /// `true` when all three springs have settled.
     pub fn is_settled(&self) -> bool {
         self.width.is_settled() && self.height.is_settled() && self.radius.is_settled()
     }

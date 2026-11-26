@@ -1,7 +1,7 @@
 //! Damped harmonic spring physics used by the island geometry.
 
 pub const COLLAPSED_WIDTH: f32 = 178.0;
-pub const COLLAPSED_BADGE_WIDTH: f32 = 228.0;
+pub const COLLAPSED_BADGE_WIDTH: f32 = 232.0;
 pub const COLLAPSED_HEIGHT: f32 = 34.0;
 pub const COLLAPSED_RADIUS: f32 = 17.0;
 
@@ -14,12 +14,8 @@ pub const NOTIFICATION_HEIGHT: f32 = 88.0;
 pub const NOTIFICATION_RADIUS: f32 = 26.0;
 
 pub const EXPANDED_WIDTH: f32 = 440.0;
-pub const EXPANDED_HEIGHT: f32 = 120.0;
+pub const EXPANDED_HEIGHT: f32 = 162.0;
 pub const EXPANDED_RADIUS: f32 = 28.0;
-
-pub const EXPANDED_NOTIFS_WIDTH: f32 = 440.0;
-pub const EXPANDED_NOTIFS_HEIGHT: f32 = 162.0;
-pub const EXPANDED_NOTIFS_RADIUS: f32 = 28.0;
 
 const REST_DISTANCE: f32 = 0.05;
 const REST_VELOCITY: f32 = 0.05;
@@ -87,7 +83,6 @@ pub enum PillMode {
     Hud,
     Notification,
     Expanded,
-    ExpandedNotifications,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,11 +110,6 @@ impl PillSprings {
             PillMode::Hud => (HUD_WIDTH, HUD_HEIGHT, HUD_RADIUS),
             PillMode::Notification => (NOTIFICATION_WIDTH, NOTIFICATION_HEIGHT, NOTIFICATION_RADIUS),
             PillMode::Expanded => (EXPANDED_WIDTH, EXPANDED_HEIGHT, EXPANDED_RADIUS),
-            PillMode::ExpandedNotifications => (
-                EXPANDED_NOTIFS_WIDTH,
-                EXPANDED_NOTIFS_HEIGHT,
-                EXPANDED_NOTIFS_RADIUS,
-            ),
         };
         let w_chg = self.width.set_target(w);
         let h_chg = self.height.set_target(h);

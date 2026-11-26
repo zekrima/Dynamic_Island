@@ -60,6 +60,14 @@ Zekrima memakai Windows `UserNotificationListener` untuk menampilkan toast notif
 | **Klik kanan pada pill** | Menu cepat: `Notification Settings`, `Reset Position`, `Exit`. |
 | **Tekan `Esc` saat kursor di atas pill** | Keluar dari Zekrima dengan cepat. |
 
+### 5 Tab Produktivitas (Mode Expanded)
+Saat pill mengembang (`440 × 162`), tersedia 5 tab di bagian atas:
+- **`Media`**: kontrol musik (album art, judul/artis, Previous/Play-Pause/Next, visualizer FFT, jam) atau jam besar + volume saat idle.
+- **`Timer`**: Focus / Pomodoro Timer dengan preset **`5m`**, **`15m`**, **`25m`**, **`45m`**, tombol **`Start`/`Pause`** & **`Reset`**, progress bar, indikator countdown di collapsed pill, serta toast notifikasi otomatis saat waktu habis.
+- **`Clip`**: riwayat teks clipboard (`Ctrl+C`) berbasis `WM_CLIPBOARDUPDATE` (event-driven, 0% polling). Klik baris mana saja untuk copy ulang secara instan, atau klik **`Clear`**.
+- **`Sys`**: System Monitor ringkas (**CPU %**, **Memory GB/%**, **Battery/Power**) dengan bar berkode warna — hanya di-sample saat tab `Sys` dibuka (`0.0%` idle CPU).
+- **`Notifs`**: daftar notifikasi Windows bergaya Pillar.
+
 ### Jam & Status Idle
 - **Mode Collapsed**: menampilkan jam **`HH:MM`** tebal dan jelas bersama indikator Zekrima (dan badge notifikasi jika ada).
 - **Mode Expanded (tanpa media)**: menampilkan **jam besar + tanggal**, status notifikasi, serta bar level volume sistem secara real-time.

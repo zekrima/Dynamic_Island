@@ -200,6 +200,36 @@ impl NotificationService {
         self.dismiss(id);
     }
 
+    /// Pushes a local in-app toast (e.g. Pomodoro completion alert) directly
+    /// into the Pillar toast UI without requiring external notification access.
+    pub fn push_local_toast(&self, app: &str, title: &str, body: &str) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let id = 0x8000_0000u32 | ((now_ms as u32) & 0x7FFF_FFFF);
+        let item = NotificationItem {
+            id,
+            app: app.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            timestamp_ms: now_ms,
+            aumid: None,
+        };
+        let now = Instant::now();
+        {
+            let mut guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            guard.items.insert(0, item.clone());
+            guard.items.truncate(MAX_NOTIFICATIONS);
+            guard.toast = Some(item);
+            guard.toast_started_at = Some(now);
+            guard.toast_until = Some(now + NOTIFICATION_TOAST_DURATION);
+        }
+        unsafe {
+            let _ = PostMessageW(self.hwnd, WM_NOTIFICATION_UPDATED, WPARAM(0), LPARAM(0));
+        }
+    }
+
     /// Opens Windows Settings -> Privacy & security -> Notifications and queues
     /// an access re-check so permissions take effect without restarting.
     pub fn open_windows_settings(&self) {

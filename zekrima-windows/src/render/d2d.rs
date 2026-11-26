@@ -1,13 +1,10 @@
 //! Direct2D renderer for the layered island window.
 //!
-//! Rendering happens into a 32-bit top-down DIB section selected into a memory
-//! DC. Direct2D draws through an `ID2D1DCRenderTarget` using premultiplied
-//! BGRA, then `UpdateLayeredWindow(ULW_ALPHA)` publishes the bitmap with
-//! per-pixel transparency.
-//!
-//! Renders media widgets, transient volume/brightness HUD, Pillar-style
-//! notification toasts / badges / expanded list, and idle status cards,
-//! all clipped cleanly to the animated pill bounds.
+//! Renders:
+//! - Collapsed pill (bold clock, Zekrima brand / album art, 5-bar real-time FFT
+//!   music equalizer, live Pomodoro timer pill, Pillar notification badge)
+//! - Transient Volume / Brightness HUD & Pillar incoming notification toast
+//! - Unified 5-tab Expanded Island (`Media`, `Timer`, `Clip`, `Sys`, `Notifs`)
 
 use std::ffi::c_void;
 use std::mem::size_of;
@@ -47,15 +44,18 @@ use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
 
 use crate::layout::{CANVAS_HEIGHT_LOGICAL, CANVAS_WIDTH_LOGICAL, PILL_TOP_LOGICAL};
 use crate::render::widgets::{
-    self, app_accent_rgb, app_initial, control_rect, expansion_progress, format_relative_time,
-    notif_card_dismiss_rect, notif_card_rect, smoothstep, ExpandedTab, HitTarget, RectF,
-    ARTIST_BOX, COLLAPSED_ART, CONTROLS_TOP, EQUALIZER_BAR_COUNT, EQUALIZER_BAR_GAP,
-    EQUALIZER_BAR_WIDTH, EQUALIZER_RIGHT, EXPANDED_ART, EXPANDED_NOTIFS_BTN,
-    NOTIF_CARD_MAX_VISIBLE, NOTIF_CLEAR_BTN, NOTIF_MEDIA_TAB_BTN, NOTIF_MEDIA_TAB_BTN_RIGHT,
-    NOTIF_SETTINGS_BTN, TITLE_BOX, TOAST_AVATAR, TOAST_DISMISS_BTN, TOAST_PROGRESS_RECT,
+    app_accent_rgb, app_initial, clip_row_rect, control_rect, expansion_progress,
+    format_relative_time, notif_card_dismiss_rect, notif_card_rect, smoothstep, tab_rect,
+    timer_preset_rect, ExpandedTab, HitTarget, RectF, ALL_TABS, ARTIST_BOX, CLIP_CLEAR_BTN,
+    CLIP_MAX_VISIBLE, COLLAPSED_ART, CONTROLS_TOP, EQUALIZER_BAR_COUNT, EQUALIZER_BAR_GAP,
+    EQUALIZER_BAR_WIDTH, EQUALIZER_RIGHT, EXPANDED_ART, NOTIF_CARD_MAX_VISIBLE, NOTIF_CLEAR_BTN,
+    NOTIF_SETTINGS_BTN, TIMER_PROGRESS_BAR, TIMER_RESET_BTN, TIMER_TOGGLE_BTN, TITLE_BOX,
+    TOAST_AVATAR, TOAST_DISMISS_BTN, TOAST_PROGRESS_RECT,
 };
 use crate::services::media::{AlbumArt, MediaControl, MediaInfo};
 use crate::services::notifications::{NotificationItem, NotificationSnapshot};
+use crate::services::pomodoro::{PomodoroTimer, TIMER_PRESETS_SECS};
+use crate::services::sysmon::SystemStats;
 use crate::services::system::{HudKind, HudState, SystemSnapshot};
 
 const PILL_FILL: D2D1_COLOR_F = D2D1_COLOR_F {
@@ -119,14 +119,13 @@ const ART_PLACEHOLDER: D2D1_COLOR_F = D2D1_COLOR_F {
     a: 0.07,
 };
 
-const TITLE_FONT_SIZE: f32 = 20.0;
-const ARTIST_FONT_SIZE: f32 = 16.0;
+const TITLE_FONT_SIZE: f32 = 19.0;
+const ARTIST_FONT_SIZE: f32 = 15.0;
 const COLLAPSED_ART_RADIUS: f32 = 6.0;
 const EXPANDED_ART_RADIUS: f32 = 14.0;
 const HOVER_RADIUS: f32 = 16.0;
 const PAUSED_EQUALIZER: [f32; EQUALIZER_BAR_COUNT] = [0.22, 0.45, 0.30, 0.50, 0.25];
 
-/// Everything the renderer needs for one frame.
 pub struct Frame<'a> {
     pub width: f32,
     pub height: f32,
@@ -138,6 +137,10 @@ pub struct Frame<'a> {
     pub eq_levels: [f32; EQUALIZER_BAR_COUNT],
     pub system: &'a SystemSnapshot,
     pub notification: &'a NotificationSnapshot,
+    pub timer: &'a PomodoroTimer,
+    pub clip_items: &'a [String],
+    pub clip_copied_flash: bool,
+    pub sys_stats: &'a SystemStats,
 }
 
 pub struct Renderer {
@@ -231,7 +234,7 @@ impl Renderer {
                 r: 1.0,
                 g: 1.0,
                 b: 1.0,
-                a: 0.18,
+                a: 0.16,
             },
             None,
         )?;
@@ -300,7 +303,7 @@ impl Renderer {
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
-            12.5,
+            12.0,
             w!("en-us"),
         )?;
         hud_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
@@ -348,7 +351,7 @@ impl Renderer {
             DWRITE_FONT_WEIGHT_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
-            32.0,
+            34.0,
             w!("en-us"),
         )?;
         clock_hero_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
@@ -360,7 +363,7 @@ impl Renderer {
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
-            11.5,
+            11.0,
             w!("en-us"),
         )?;
         notif_app_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
@@ -371,7 +374,7 @@ impl Renderer {
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
-            13.0,
+            12.5,
             w!("en-us"),
         )?;
         notif_title_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
@@ -558,8 +561,7 @@ impl Renderer {
         let hud_visible = frame.system.hud.is_visible(now);
         let toast_visible = frame.notification.is_toast_visible(now);
 
-        // Top-edge subtle accent highlight: uses app color during incoming toast,
-        // otherwise Zekrima crimson accent.
+        // Top-edge accent highlight
         let inset = radius.max(14.0);
         if width > inset * 2.0 + 4.0 {
             let accent_rect = D2D1_ROUNDED_RECT {
@@ -581,14 +583,14 @@ impl Renderer {
                         .FillRoundedRectangle(&accent_rect, &self.dynamic_brush);
                 }
             } else {
-                self.accent_brush.SetOpacity(0.40);
+                self.accent_brush.SetOpacity(0.42);
                 self.target
                     .FillRoundedRectangle(&accent_rect, &self.accent_brush);
                 self.accent_brush.SetOpacity(1.0);
             }
         }
 
-        // Clip all interior content cleanly to the animated pill rectangle.
+        // Clip all interior content to pill bounds
         let clip = D2D_RECT_F {
             left: left + 1.0,
             top: top + 1.0,
@@ -607,39 +609,54 @@ impl Renderer {
                 let progress = frame.notification.toast_progress(now);
                 self.draw_notification_toast(left, top, toast, progress, frame.hovered_target);
             }
-        } else if frame.expanded && frame.expanded_tab == ExpandedTab::Notifications {
+        } else if frame.expanded || expanded_progress >= 0.28 {
             let alpha = smoothstep(((expanded_progress - 0.15) / 0.85).clamp(0.0, 1.0));
-            self.draw_notifications_panel(
-                left,
-                top,
-                width,
-                frame.notification,
-                frame.hovered_target,
-                alpha,
-            );
-        } else if frame.media.has_session {
-            self.draw_media(left, top, width, height, frame);
-        } else if expanded_progress < 0.25 {
-            self.draw_idle_brand(
-                left,
-                top,
-                width,
-                height,
-                frame.notification,
-                1.0 - expanded_progress * 4.0,
-            );
+            if alpha > 0.01 {
+                self.draw_tab_bar(left, top, frame, alpha);
+                match frame.expanded_tab {
+                    ExpandedTab::Media => {
+                        if frame.media.has_session {
+                            self.draw_expanded_media(left, top, frame, alpha);
+                        } else {
+                            self.draw_idle_expanded(left, top, width, height, frame.system, frame.notification, alpha);
+                        }
+                    }
+                    ExpandedTab::Timer => {
+                        self.draw_timer_panel(left, top, frame.timer, frame.hovered_target, alpha);
+                    }
+                    ExpandedTab::Clipboard => {
+                        self.draw_clipboard_panel(
+                            left,
+                            top,
+                            width,
+                            frame.clip_items,
+                            frame.clip_copied_flash,
+                            frame.hovered_target,
+                            alpha,
+                        );
+                    }
+                    ExpandedTab::System => {
+                        self.draw_sysmon_panel(left, top, width, frame.sys_stats, alpha);
+                    }
+                    ExpandedTab::Notifications => {
+                        self.draw_notifications_panel(
+                            left,
+                            top,
+                            width,
+                            frame.notification,
+                            frame.hovered_target,
+                            alpha,
+                        );
+                    }
+                }
+            }
         } else {
-            let alpha = smoothstep(((expanded_progress - 0.20) / 0.80).clamp(0.0, 1.0));
-            self.draw_idle_expanded(
-                left,
-                top,
-                width,
-                height,
-                frame.system,
-                frame.notification,
-                frame.hovered_target,
-                alpha,
-            );
+            let collapsed_alpha = (1.0 - expanded_progress * 3.5).clamp(0.0, 1.0);
+            if frame.media.has_session {
+                self.draw_collapsed_media(left, top, width, height, frame, collapsed_alpha);
+            } else {
+                self.draw_collapsed_idle(left, top, width, height, frame, collapsed_alpha);
+            }
         }
 
         self.target.PopAxisAlignedClip();
@@ -651,166 +668,918 @@ impl Renderer {
         self.present(hwnd)
     }
 
-    unsafe fn draw_media(
+    /// Top 5-tab pill switcher shared by all expanded views.
+    unsafe fn draw_tab_bar(&self, origin_x: f32, origin_y: f32, frame: &Frame, alpha: f32) {
+        let unread = frame.notification.unread_count();
+        for tab in ALL_TABS {
+            let rect = tab_rect(tab);
+            let active = frame.expanded_tab == tab;
+            let hovered = frame.hovered_target == Some(HitTarget::SelectTab(tab));
+
+            let pill = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: origin_x + rect.left,
+                    top: origin_y + rect.top,
+                    right: origin_x + rect.right,
+                    bottom: origin_y + rect.bottom,
+                },
+                radiusX: rect.height() / 2.0,
+                radiusY: rect.height() / 2.0,
+            };
+
+            if active {
+                self.accent_brush.SetOpacity(0.28 * alpha);
+                self.target.FillRoundedRectangle(&pill, &self.accent_brush);
+                self.accent_brush.SetOpacity(0.65 * alpha);
+                self.target
+                    .DrawRoundedRectangle(&pill, &self.accent_brush, 1.0, None);
+                self.accent_brush.SetOpacity(1.0);
+            } else {
+                self.hover_brush
+                    .SetOpacity(if hovered { 0.14 } else { 0.055 } * alpha);
+                self.target.FillRoundedRectangle(&pill, &self.hover_brush);
+            }
+
+            let label = match tab {
+                ExpandedTab::Media => "Media".to_string(),
+                ExpandedTab::Timer => {
+                    if frame.timer.running {
+                        frame.timer.formatted()
+                    } else {
+                        "Timer".to_string()
+                    }
+                }
+                ExpandedTab::Clipboard => "Clip".to_string(),
+                ExpandedTab::System => "Sys".to_string(),
+                ExpandedTab::Notifications => {
+                    if unread > 9 {
+                        "Notifs 9+".to_string()
+                    } else if unread > 0 {
+                        format!("Notifs {unread}")
+                    } else {
+                        "Notifs".to_string()
+                    }
+                }
+            };
+
+            let u16_lbl: Vec<u16> = label.encode_utf16().collect();
+            if let Ok(layout) = self.dwrite.CreateTextLayout(
+                &u16_lbl,
+                &self.pill_btn_format,
+                rect.width(),
+                rect.height(),
+            ) {
+                let text_alpha = if active {
+                    1.0
+                } else if hovered {
+                    0.92
+                } else {
+                    0.68
+                };
+                self.title_brush.SetOpacity(text_alpha * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F {
+                        x: origin_x + rect.left,
+                        y: origin_y + rect.top,
+                    },
+                    &layout,
+                    &self.title_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+        }
+    }
+
+    unsafe fn draw_collapsed_media(
         &self,
         origin_x: f32,
         origin_y: f32,
         pill_width: f32,
         pill_height: f32,
         frame: &Frame,
+        alpha: f32,
     ) {
-        let progress = expansion_progress(pill_height);
-        let expanded = smoothstep(progress);
-        let collapsed_alpha = 1.0 - progress;
+        self.draw_art(origin_x, origin_y, &COLLAPSED_ART, COLLAPSED_ART_RADIUS);
 
-        let art = COLLAPSED_ART.lerp(&EXPANDED_ART, expanded);
-        let art_radius = widgets::lerp(COLLAPSED_ART_RADIUS, EXPANDED_ART_RADIUS, expanded);
-        self.draw_art(origin_x, origin_y, &art, art_radius);
+        let unread = frame.notification.unread_count();
+        let center_text = if frame.timer.running {
+            frame.timer.formatted()
+        } else {
+            current_clock_string()
+        };
+        let center_u16: Vec<u16> = center_text.encode_utf16().collect();
 
-        if collapsed_alpha > 0.01 {
-            let unread = frame.notification.unread_count();
-            let clock = current_clock_string();
-            let clock_u16: Vec<u16> = clock.encode_utf16().collect();
+        if unread > 0 {
+            if let Ok(layout) = self.dwrite.CreateTextLayout(
+                &center_u16,
+                &self.clock_collapsed_format,
+                66.0,
+                pill_height,
+            ) {
+                if frame.timer.running {
+                    self.accent_brush.SetOpacity(alpha);
+                    self.target.DrawTextLayout(
+                        D2D_POINT_2F { x: origin_x + 36.0, y: origin_y },
+                        &layout,
+                        &self.accent_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                    self.accent_brush.SetOpacity(1.0);
+                } else {
+                    self.title_brush.SetOpacity(0.96 * alpha);
+                    self.target.DrawTextLayout(
+                        D2D_POINT_2F { x: origin_x + 36.0, y: origin_y },
+                        &layout,
+                        &self.title_brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                }
+            }
+
+            self.draw_equalizer(
+                origin_x,
+                origin_y,
+                pill_height / 2.0,
+                &frame.eq_levels,
+                frame.media.is_playing,
+                alpha,
+                pill_width - 62.0,
+                EQUALIZER_BAR_WIDTH,
+                EQUALIZER_BAR_GAP,
+                3.5,
+                14.5,
+            );
+            if let Some(app_name) = frame.notification.latest_app_name() {
+                self.draw_collapsed_notification_badge(
+                    origin_x,
+                    origin_y,
+                    pill_width,
+                    pill_height,
+                    app_name,
+                    unread,
+                    alpha,
+                );
+            }
+        } else {
+            if let Ok(layout) = self.dwrite.CreateTextLayout(
+                &center_u16,
+                &self.clock_collapsed_format,
+                76.0,
+                pill_height,
+            ) {
+                self.title_brush.SetOpacity(0.97 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: origin_x + 42.0, y: origin_y },
+                    &layout,
+                    &self.title_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+
+            self.draw_equalizer(
+                origin_x,
+                origin_y,
+                pill_height / 2.0,
+                &frame.eq_levels,
+                frame.media.is_playing,
+                alpha,
+                EQUALIZER_RIGHT,
+                EQUALIZER_BAR_WIDTH,
+                EQUALIZER_BAR_GAP,
+                3.5,
+                14.5,
+            );
+        }
+    }
+
+    unsafe fn draw_collapsed_idle(
+        &self,
+        pill_left: f32,
+        pill_top: f32,
+        pill_width: f32,
+        pill_height: f32,
+        frame: &Frame,
+        alpha: f32,
+    ) {
+        let dot = D2D1_ELLIPSE {
+            point: D2D_POINT_2F {
+                x: pill_left + 18.0,
+                y: pill_top + pill_height / 2.0,
+            },
+            radiusX: 4.0,
+            radiusY: 4.0,
+        };
+        self.accent_brush.SetOpacity(0.95 * alpha);
+        self.target.FillEllipse(&dot, &self.accent_brush);
+        self.accent_brush.SetOpacity(1.0);
+
+        let clock = current_clock_string();
+        let clock_u16: Vec<u16> = clock.encode_utf16().collect();
+        let unread = frame.notification.unread_count();
+
+        if frame.timer.running {
+            // [●] 24:59   10:22  (or [●] 24:59   [Avatar][Badge])
+            let t_str = frame.timer.formatted();
+            let t_u16: Vec<u16> = t_str.encode_utf16().collect();
+            if let Ok(layout) = self.dwrite.CreateTextLayout(
+                &t_u16,
+                &self.clock_collapsed_format,
+                64.0,
+                pill_height,
+            ) {
+                self.accent_brush.SetOpacity(alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: pill_left + 28.0, y: pill_top },
+                    &layout,
+                    &self.accent_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+                self.accent_brush.SetOpacity(1.0);
+            }
 
             if unread > 0 {
-                // Collapsed media + clock + live rhythm bars + notification badge
-                if let Ok(layout) = self.dwrite.CreateTextLayout(
-                    &clock_u16,
-                    &self.clock_collapsed_format,
-                    64.0,
-                    pill_height,
-                ) {
-                    self.title_brush.SetOpacity(0.95 * collapsed_alpha);
-                    self.target.DrawTextLayout(
-                        D2D_POINT_2F {
-                            x: origin_x + 36.0,
-                            y: origin_y,
-                        },
-                        &layout,
-                        &self.title_brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                }
-
-                self.draw_equalizer(
-                    origin_x,
-                    origin_y,
-                    pill_height / 2.0,
-                    &frame.eq_levels,
-                    frame.media.is_playing,
-                    collapsed_alpha,
-                    pill_width - 62.0,
-                    EQUALIZER_BAR_WIDTH,
-                    EQUALIZER_BAR_GAP,
-                    3.5,
-                    14.5,
-                );
                 if let Some(app_name) = frame.notification.latest_app_name() {
                     self.draw_collapsed_notification_badge(
-                        origin_x,
-                        origin_y,
-                        pill_width,
-                        pill_height,
-                        app_name,
-                        unread,
-                        collapsed_alpha,
+                        pill_left, pill_top, pill_width, pill_height, app_name, unread, alpha,
                     );
                 }
-            } else {
-                // Collapsed media: [Art]  10:22  [|||||]
-                if let Ok(layout) = self.dwrite.CreateTextLayout(
-                    &clock_u16,
-                    &self.clock_collapsed_format,
-                    76.0,
-                    pill_height,
-                ) {
-                    self.title_brush.SetOpacity(0.96 * collapsed_alpha);
-                    self.target.DrawTextLayout(
-                        D2D_POINT_2F {
-                            x: origin_x + 42.0,
-                            y: origin_y,
-                        },
-                        &layout,
-                        &self.title_brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                }
+            } else if let Ok(layout) = self.dwrite.CreateTextLayout(
+                &clock_u16,
+                &self.clock_collapsed_format,
+                66.0,
+                pill_height,
+            ) {
+                self.title_brush.SetOpacity(0.95 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: pill_left + pill_width - 74.0, y: pill_top },
+                    &layout,
+                    &self.title_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+            return;
+        }
 
-                self.draw_equalizer(
-                    origin_x,
-                    origin_y,
-                    pill_height / 2.0,
-                    &frame.eq_levels,
-                    frame.media.is_playing,
-                    collapsed_alpha,
-                    EQUALIZER_RIGHT,
-                    EQUALIZER_BAR_WIDTH,
-                    EQUALIZER_BAR_GAP,
-                    3.5,
-                    14.5,
+        if unread > 0 {
+            if let Ok(layout) = self.dwrite.CreateTextLayout(
+                &clock_u16,
+                &self.clock_collapsed_format,
+                68.0,
+                pill_height,
+            ) {
+                self.title_brush.SetOpacity(0.98 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: pill_left + 30.0, y: pill_top },
+                    &layout,
+                    &self.title_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+            if let Some(app_name) = frame.notification.latest_app_name() {
+                self.draw_collapsed_notification_badge(
+                    pill_left, pill_top, pill_width, pill_height, app_name, unread, alpha,
+                );
+            }
+        } else {
+            let label: Vec<u16> = "Zekrima".encode_utf16().collect();
+            if let Ok(layout) =
+                self.dwrite
+                    .CreateTextLayout(&label, &self.hud_format, 72.0, pill_height)
+            {
+                self.hud_text_brush.SetOpacity(0.82 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F {
+                        x: pill_left + 29.0,
+                        y: pill_top + (pill_height - 15.0) / 2.0,
+                    },
+                    &layout,
+                    &self.hud_text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+
+            if let Ok(layout) = self.dwrite.CreateTextLayout(
+                &clock_u16,
+                &self.clock_collapsed_format,
+                66.0,
+                pill_height,
+            ) {
+                self.title_brush.SetOpacity(0.98 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: pill_left + pill_width - 74.0, y: pill_top },
+                    &layout,
+                    &self.title_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+        }
+    }
+
+    unsafe fn draw_expanded_media(&self, origin_x: f32, origin_y: f32, frame: &Frame, alpha: f32) {
+        self.draw_art(origin_x, origin_y, &EXPANDED_ART, EXPANDED_ART_RADIUS);
+        self.draw_text(origin_x, origin_y, alpha);
+
+        let hovered_ctrl = match frame.hovered_target {
+            Some(HitTarget::MediaControl(c)) => Some(c),
+            _ => None,
+        };
+        self.draw_controls(origin_x, origin_y, alpha, frame.media.is_playing, hovered_ctrl);
+
+        // Live 5-bar FFT equalizer
+        self.draw_equalizer(
+            origin_x,
+            origin_y,
+            CONTROLS_TOP + 15.0,
+            &frame.eq_levels,
+            frame.media.is_playing,
+            alpha,
+            344.0,
+            4.0,
+            3.5,
+            4.0,
+            20.0,
+        );
+
+        // Bold clock at bottom-right
+        let clock = current_clock_string();
+        let clock_u16: Vec<u16> = clock.encode_utf16().collect();
+        if let Ok(layout) =
+            self.dwrite
+                .CreateTextLayout(&clock_u16, &self.clock_media_format, 74.0, 30.0)
+        {
+            self.title_brush.SetOpacity(0.96 * alpha);
+            self.target.DrawTextLayout(
+                D2D_POINT_2F {
+                    x: origin_x + 350.0,
+                    y: origin_y + CONTROLS_TOP,
+                },
+                &layout,
+                &self.title_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
+    }
+
+    unsafe fn draw_idle_expanded(
+        &self,
+        pill_left: f32,
+        pill_top: f32,
+        pill_width: f32,
+        pill_height: f32,
+        system: &SystemSnapshot,
+        notif: &NotificationSnapshot,
+        alpha: f32,
+    ) {
+        let pad_x = 22.0f32;
+        let content_w = (pill_width - pad_x * 2.0).max(40.0);
+
+        // Hero clock (`34px` Bold) + short date & status
+        let st = GetLocalTime();
+        let clock = format!("{:02}:{:02}", st.wHour, st.wMinute);
+        let clock_u16: Vec<u16> = clock.encode_utf16().collect();
+        if let Ok(layout) =
+            self.dwrite
+                .CreateTextLayout(&clock_u16, &self.clock_hero_format, 125.0, 44.0)
+        {
+            self.title_brush.SetOpacity(alpha);
+            self.target.DrawTextLayout(
+                D2D_POINT_2F {
+                    x: pill_left + pad_x,
+                    y: pill_top + 48.0,
+                },
+                &layout,
+                &self.title_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
+
+        let date_str = format_short_date(&st);
+        let sub_text = if notif.unread_count() > 0 {
+            format!("{date_str}  •  {} unread", notif.unread_count())
+        } else {
+            format!("{date_str}  •  No media playing")
+        };
+        let sub: Vec<u16> = sub_text.encode_utf16().collect();
+        if let Ok(layout) =
+            self.dwrite
+                .CreateTextLayout(&sub, &self.artist_format, content_w - 122.0, 24.0)
+        {
+            self.artist_brush.SetOpacity(0.78 * alpha);
+            self.target.DrawTextLayout(
+                D2D_POINT_2F {
+                    x: pill_left + pad_x + 118.0,
+                    y: pill_top + 62.0,
+                },
+                &layout,
+                &self.artist_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
+
+        // Live system volume bar
+        let bar_y = pill_top + pill_height - 24.0;
+        let bar_h = 6.0f32;
+        let vol_label = if system.muted {
+            "Volume  •  Muted".to_string()
+        } else {
+            format!("Volume  •  {}%", (system.volume * 100.0).round() as u32)
+        };
+        let vol_u16: Vec<u16> = vol_label.encode_utf16().collect();
+        if let Ok(layout) =
+            self.dwrite
+                .CreateTextLayout(&vol_u16, &self.hud_format, content_w, 16.0)
+        {
+            self.hud_text_brush.SetOpacity(0.66 * alpha);
+            self.target.DrawTextLayout(
+                D2D_POINT_2F {
+                    x: pill_left + pad_x,
+                    y: bar_y - 19.0,
+                },
+                &layout,
+                &self.hud_text_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
+
+        let track = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: pill_left + pad_x,
+                top: bar_y,
+                right: pill_left + pad_x + content_w,
+                bottom: bar_y + bar_h,
+            },
+            radiusX: bar_h / 2.0,
+            radiusY: bar_h / 2.0,
+        };
+        self.hud_track_brush.SetOpacity(alpha);
+        self.target
+            .FillRoundedRectangle(&track, &self.hud_track_brush);
+
+        let fill_w = (content_w * system.volume.clamp(0.0, 1.0))
+            .max(if system.volume > 0.001 { bar_h } else { 0.0 });
+        if fill_w > 0.0 {
+            let fill = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: pill_left + pad_x,
+                    top: bar_y,
+                    right: pill_left + pad_x + fill_w,
+                    bottom: bar_y + bar_h,
+                },
+                radiusX: bar_h / 2.0,
+                radiusY: bar_h / 2.0,
+            };
+            self.hud_fill_brush
+                .SetOpacity(if system.muted { 0.30 } else { 0.88 } * alpha);
+            self.target
+                .FillRoundedRectangle(&fill, &self.hud_fill_brush);
+        }
+    }
+
+    /// Focus / Pomodoro Timer panel.
+    unsafe fn draw_timer_panel(
+        &self,
+        origin_x: f32,
+        origin_y: f32,
+        timer: &PomodoroTimer,
+        hovered: Option<HitTarget>,
+        alpha: f32,
+    ) {
+        let time_str = timer.formatted();
+        let time_u16: Vec<u16> = time_str.encode_utf16().collect();
+        if let Ok(layout) =
+            self.dwrite
+                .CreateTextLayout(&time_u16, &self.clock_hero_format, 180.0, 44.0)
+        {
+            self.title_brush.SetOpacity(alpha);
+            self.target.DrawTextLayout(
+                D2D_POINT_2F {
+                    x: origin_x + 22.0,
+                    y: origin_y + 44.0,
+                },
+                &layout,
+                &self.title_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
+
+        let status = if timer.running {
+            "Focus • Running"
+        } else if timer.completed {
+            "Focus • Complete!"
+        } else if timer.remaining_secs < timer.total_secs {
+            "Focus • Paused"
+        } else {
+            "Focus • Ready"
+        };
+        let status_u16: Vec<u16> = status.encode_utf16().collect();
+        if let Ok(layout) =
+            self.dwrite
+                .CreateTextLayout(&status_u16, &self.notif_app_format, 180.0, 18.0)
+        {
+            if timer.running {
+                self.accent_brush.SetOpacity(0.95 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: origin_x + 22.0, y: origin_y + 88.0 },
+                    &layout,
+                    &self.accent_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+                self.accent_brush.SetOpacity(1.0);
+            } else {
+                self.artist_brush.SetOpacity(0.75 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: origin_x + 22.0, y: origin_y + 88.0 },
+                    &layout,
+                    &self.artist_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
                 );
             }
         }
 
-        if expanded > 0.01 {
-            self.draw_text(origin_x, origin_y, expanded);
+        // Start / Pause accent button
+        let toggle_lbl = if timer.running { "Pause" } else { "Start" };
+        let toggle_hovered = hovered == Some(HitTarget::TimerToggle);
+        let toggle_rect = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: origin_x + TIMER_TOGGLE_BTN.left,
+                top: origin_y + TIMER_TOGGLE_BTN.top,
+                right: origin_x + TIMER_TOGGLE_BTN.right,
+                bottom: origin_y + TIMER_TOGGLE_BTN.bottom,
+            },
+            radiusX: 15.0,
+            radiusY: 15.0,
+        };
+        self.accent_brush
+            .SetOpacity(if toggle_hovered { 0.96 } else { 0.80 } * alpha);
+        self.target
+            .FillRoundedRectangle(&toggle_rect, &self.accent_brush);
+        self.accent_brush.SetOpacity(1.0);
 
-            let controls_alpha = smoothstep(((progress - 0.45) / 0.55).clamp(0.0, 1.0));
-            if controls_alpha > 0.01 {
-                let hovered_ctrl = match frame.hovered_target {
-                    Some(HitTarget::MediaControl(c)) => Some(c),
-                    _ => None,
+        let t_u16: Vec<u16> = toggle_lbl.encode_utf16().collect();
+        if let Ok(layout) = self.dwrite.CreateTextLayout(
+            &t_u16,
+            &self.pill_btn_format,
+            TIMER_TOGGLE_BTN.width(),
+            TIMER_TOGGLE_BTN.height(),
+        ) {
+            self.title_brush.SetOpacity(alpha);
+            self.target.DrawTextLayout(
+                D2D_POINT_2F {
+                    x: origin_x + TIMER_TOGGLE_BTN.left,
+                    y: origin_y + TIMER_TOGGLE_BTN.top,
+                },
+                &layout,
+                &self.title_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
+
+        // Reset button
+        self.draw_action_pill(
+            origin_x,
+            origin_y,
+            TIMER_RESET_BTN,
+            "Reset",
+            hovered == Some(HitTarget::TimerReset),
+            alpha,
+        );
+
+        // 4 preset buttons (5m, 15m, 25m, 45m)
+        for (i, &secs) in TIMER_PRESETS_SECS.iter().enumerate() {
+            let rect = timer_preset_rect(i);
+            let selected = timer.total_secs == secs;
+            let is_hov = hovered == Some(HitTarget::TimerPreset(secs));
+            let lbl = format!("{}m", secs / 60);
+
+            let d2d_r = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: origin_x + rect.left,
+                    top: origin_y + rect.top,
+                    right: origin_x + rect.right,
+                    bottom: origin_y + rect.bottom,
+                },
+                radiusX: 12.0,
+                radiusY: 12.0,
+            };
+            self.hover_brush.SetOpacity(
+                if selected {
+                    0.20
+                } else if is_hov {
+                    0.15
+                } else {
+                    0.07
+                } * alpha,
+            );
+            self.target.FillRoundedRectangle(&d2d_r, &self.hover_brush);
+
+            let lbl_u16: Vec<u16> = lbl.encode_utf16().collect();
+            if let Ok(layout) = self.dwrite.CreateTextLayout(
+                &lbl_u16,
+                &self.pill_btn_format,
+                rect.width(),
+                rect.height(),
+            ) {
+                self.title_brush
+                    .SetOpacity(if selected || is_hov { 1.0 } else { 0.72 } * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F {
+                        x: origin_x + rect.left,
+                        y: origin_y + rect.top,
+                    },
+                    &layout,
+                    &self.title_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+        }
+
+        // Bottom progress bar
+        let bar_h = TIMER_PROGRESS_BAR.height();
+        let track = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: origin_x + TIMER_PROGRESS_BAR.left,
+                top: origin_y + TIMER_PROGRESS_BAR.top,
+                right: origin_x + TIMER_PROGRESS_BAR.right,
+                bottom: origin_y + TIMER_PROGRESS_BAR.bottom,
+            },
+            radiusX: bar_h / 2.0,
+            radiusY: bar_h / 2.0,
+        };
+        self.hud_track_brush.SetOpacity(alpha);
+        self.target
+            .FillRoundedRectangle(&track, &self.hud_track_brush);
+
+        let fill_w = (TIMER_PROGRESS_BAR.width() * timer.progress()).max(0.0);
+        if fill_w > 1.0 {
+            let fill = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: origin_x + TIMER_PROGRESS_BAR.left,
+                    top: origin_y + TIMER_PROGRESS_BAR.top,
+                    right: origin_x + TIMER_PROGRESS_BAR.left + fill_w,
+                    bottom: origin_y + TIMER_PROGRESS_BAR.bottom,
+                },
+                radiusX: bar_h / 2.0,
+                radiusY: bar_h / 2.0,
+            };
+            self.accent_brush.SetOpacity(0.92 * alpha);
+            self.target.FillRoundedRectangle(&fill, &self.accent_brush);
+            self.accent_brush.SetOpacity(1.0);
+        }
+    }
+
+    /// Quick Clipboard History panel (click any row to copy back).
+    unsafe fn draw_clipboard_panel(
+        &self,
+        origin_x: f32,
+        origin_y: f32,
+        pill_width: f32,
+        items: &[String],
+        copied_flash: bool,
+        hovered: Option<HitTarget>,
+        alpha: f32,
+    ) {
+        let header = if copied_flash {
+            "Copied to clipboard!".to_string()
+        } else {
+            format!("Clipboard History ({})", items.len())
+        };
+        let header_u16: Vec<u16> = header.encode_utf16().collect();
+        if let Ok(layout) =
+            self.dwrite
+                .CreateTextLayout(&header_u16, &self.hud_format, 260.0, 18.0)
+        {
+            if copied_flash {
+                self.dynamic_brush.SetColor(&D2D1_COLOR_F {
+                    r: 34.0 / 255.0,
+                    g: 197.0 / 255.0,
+                    b: 94.0 / 255.0,
+                    a: alpha,
+                });
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: origin_x + 20.0, y: origin_y + 41.0 },
+                    &layout,
+                    &self.dynamic_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            } else {
+                self.hud_text_brush.SetOpacity(0.82 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: origin_x + 20.0, y: origin_y + 41.0 },
+                    &layout,
+                    &self.hud_text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+        }
+
+        if !items.is_empty() {
+            self.draw_action_pill(
+                origin_x,
+                origin_y,
+                CLIP_CLEAR_BTN,
+                "Clear",
+                hovered == Some(HitTarget::ClipClear),
+                alpha,
+            );
+        }
+
+        if items.is_empty() {
+            let m1: Vec<u16> = "Clipboard history is empty".encode_utf16().collect();
+            if let Ok(layout) = self.dwrite.CreateTextLayout(
+                &m1,
+                &self.center_title_format,
+                pill_width - 32.0,
+                22.0,
+            ) {
+                self.title_brush.SetOpacity(0.88 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: origin_x + 16.0, y: origin_y + 82.0 },
+                    &layout,
+                    &self.title_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+            let m2: Vec<u16> = "Copy any text (Ctrl+C) to pin it here".encode_utf16().collect();
+            if let Ok(layout) = self.dwrite.CreateTextLayout(
+                &m2,
+                &self.center_sub_format,
+                pill_width - 32.0,
+                20.0,
+            ) {
+                self.artist_brush.SetOpacity(0.65 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: origin_x + 16.0, y: origin_y + 106.0 },
+                    &layout,
+                    &self.artist_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+            return;
+        }
+
+        for (i, text) in items.iter().take(CLIP_MAX_VISIBLE).enumerate() {
+            let rect = clip_row_rect(i);
+            let is_hov = hovered == Some(HitTarget::ClipCopy(i));
+
+            let row = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: origin_x + rect.left,
+                    top: origin_y + rect.top,
+                    right: origin_x + rect.right,
+                    bottom: origin_y + rect.bottom,
+                },
+                radiusX: 8.0,
+                radiusY: 8.0,
+            };
+            self.hover_brush
+                .SetOpacity(if is_hov { 0.14 } else { 0.06 } * alpha);
+            self.target.FillRoundedRectangle(&row, &self.hover_brush);
+
+            // Index badge (`#1`, `#2`, `#3`)
+            let idx_str = format!("#{}", i + 1);
+            let idx_u16: Vec<u16> = idx_str.encode_utf16().collect();
+            if let Ok(layout) =
+                self.dwrite
+                    .CreateTextLayout(&idx_u16, &self.badge_format, 24.0, rect.height())
+            {
+                self.accent_brush.SetOpacity(0.90 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F {
+                        x: origin_x + rect.left + 6.0,
+                        y: origin_y + rect.top,
+                    },
+                    &layout,
+                    &self.accent_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+                self.accent_brush.SetOpacity(1.0);
+            }
+
+            let single_line = text.replace(['\r', '\n', '\t'], " ");
+            if let Ok(layout) = create_layout(
+                &self.dwrite,
+                &self.notif_body_format,
+                &self.notif_body_trim,
+                &single_line,
+                rect.width() - 42.0,
+                18.0,
+            ) {
+                self.title_brush
+                    .SetOpacity(if is_hov { 1.0 } else { 0.86 } * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F {
+                        x: origin_x + rect.left + 34.0,
+                        y: origin_y + rect.top + 5.0,
+                    },
+                    &layout,
+                    &self.title_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+        }
+    }
+
+    /// Compact System Monitor panel (CPU, RAM, Battery/Power).
+    unsafe fn draw_sysmon_panel(
+        &self,
+        origin_x: f32,
+        origin_y: f32,
+        pill_width: f32,
+        stats: &SystemStats,
+        alpha: f32,
+    ) {
+        let pad_x = 22.0f32;
+        let bar_w = (pill_width - pad_x * 2.0).max(80.0);
+
+        let ram_val = if stats.ram_total_gb > 0.1 {
+            format!(
+                "{:.1} / {:.1} GB  ({:.0}%)",
+                stats.ram_used_gb, stats.ram_total_gb, stats.ram_percent
+            )
+        } else {
+            format!("{:.0}%", stats.ram_percent)
+        };
+        let power_lbl = if stats.has_battery { "Battery" } else { "Power" };
+        let power_val = if stats.has_battery {
+            if stats.is_charging {
+                format!("{:.0}%  •  Charging", stats.battery_percent)
+            } else {
+                format!("{:.0}%", stats.battery_percent)
+            }
+        } else {
+            "AC Power".to_string()
+        };
+
+        let rows: [(&str, String, f32, bool); 3] = [
+            ("CPU", format!("{:.0}%", stats.cpu_percent), stats.cpu_percent / 100.0, false),
+            ("Memory", ram_val, stats.ram_percent / 100.0, false),
+            (power_lbl, power_val, stats.battery_percent / 100.0, true),
+        ];
+
+        for (i, (label, value, frac, is_battery)) in rows.iter().enumerate() {
+            let y = origin_y + 46.0 + i as f32 * 36.0;
+
+            let l_u16: Vec<u16> = label.encode_utf16().collect();
+            if let Ok(layout) =
+                self.dwrite
+                    .CreateTextLayout(&l_u16, &self.hud_format, bar_w, 16.0)
+            {
+                self.hud_text_brush.SetOpacity(0.90 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: origin_x + pad_x, y },
+                    &layout,
+                    &self.hud_text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+
+            let v_u16: Vec<u16> = value.encode_utf16().collect();
+            if let Ok(layout) =
+                self.dwrite
+                    .CreateTextLayout(&v_u16, &self.hud_value_format, bar_w, 16.0)
+            {
+                self.hud_text_brush.SetOpacity(0.75 * alpha);
+                self.target.DrawTextLayout(
+                    D2D_POINT_2F { x: origin_x + pad_x, y },
+                    &layout,
+                    &self.hud_text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
+
+            let bar_y = y + 19.0;
+            let bar_h = 7.0f32;
+            let track = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: origin_x + pad_x,
+                    top: bar_y,
+                    right: origin_x + pad_x + bar_w,
+                    bottom: bar_y + bar_h,
+                },
+                radiusX: bar_h / 2.0,
+                radiusY: bar_h / 2.0,
+            };
+            self.hud_track_brush.SetOpacity(alpha);
+            self.target
+                .FillRoundedRectangle(&track, &self.hud_track_brush);
+
+            let clamped = frac.clamp(0.0, 1.0);
+            let fill_w = (bar_w * clamped).max(if clamped > 0.005 { bar_h } else { 0.0 });
+            if fill_w > 0.0 {
+                let (r, g, b) = metric_bar_color(clamped, *is_battery);
+                self.dynamic_brush
+                    .SetColor(&D2D1_COLOR_F { r, g, b, a: 0.92 * alpha });
+                let fill = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: origin_x + pad_x,
+                        top: bar_y,
+                        right: origin_x + pad_x + fill_w,
+                        bottom: bar_y + bar_h,
+                    },
+                    radiusX: bar_h / 2.0,
+                    radiusY: bar_h / 2.0,
                 };
-                self.draw_controls(
-                    origin_x,
-                    origin_y,
-                    controls_alpha,
-                    frame.media.is_playing,
-                    hovered_ctrl,
-                );
-                self.draw_notifs_tab_pill(
-                    origin_x,
-                    origin_y,
-                    frame.notification.unread_count(),
-                    frame.hovered_target == Some(HitTarget::TabNotifications),
-                    controls_alpha,
-                );
-
-                // Live audio-reactive rhythm bars inside the expanded media card
-                self.draw_equalizer(
-                    origin_x,
-                    origin_y,
-                    CONTROLS_TOP + 15.0,
-                    &frame.eq_levels,
-                    frame.media.is_playing,
-                    controls_alpha,
-                    344.0,
-                    4.0,
-                    3.5,
-                    4.0,
-                    20.0,
-                );
-
-                // Bold, clear clock at bottom-right of the expanded media card
-                let clock = current_clock_string();
-                let clock_u16: Vec<u16> = clock.encode_utf16().collect();
-                if let Ok(layout) = self.dwrite.CreateTextLayout(
-                    &clock_u16,
-                    &self.clock_media_format,
-                    74.0,
-                    30.0,
-                ) {
-                    self.title_brush.SetOpacity(0.96 * controls_alpha);
-                    self.target.DrawTextLayout(
-                        D2D_POINT_2F {
-                            x: origin_x + 350.0,
-                            y: origin_y + CONTROLS_TOP,
-                        },
-                        &layout,
-                        &self.title_brush,
-                        D2D1_DRAW_TEXT_OPTIONS_NONE,
-                    );
-                }
+                self.target.FillRoundedRectangle(&fill, &self.dynamic_brush);
             }
         }
     }
@@ -946,7 +1715,6 @@ impl Renderer {
         self.target.SetTransform(&identity);
     }
 
-    /// Vertically centered audio-reactive rhythm bars driven by WASAPI FFT bands.
     #[allow(clippy::too_many_arguments)]
     unsafe fn draw_equalizer(
         &self,
@@ -999,7 +1767,6 @@ impl Renderer {
         self.accent_brush.SetOpacity(1.0);
     }
 
-    /// Pillar-style collapsed notification badge: colored circular app avatar + red count badge.
     unsafe fn draw_collapsed_notification_badge(
         &self,
         pill_left: f32,
@@ -1012,7 +1779,6 @@ impl Renderer {
     ) {
         let cy = pill_top + pill_height / 2.0;
 
-        // Red count pill on the far right
         let count_text = if count > 9 {
             "9+".to_string()
         } else {
@@ -1052,7 +1818,6 @@ impl Renderer {
             );
         }
 
-        // Colored circular app initial avatar immediately left of count badge
         let avatar_cx = count_left - 14.0;
         let (r, g, b) = app_accent_rgb(app_name);
         self.dynamic_brush.SetColor(&D2D1_COLOR_F { r, g, b, a: alpha });
@@ -1082,329 +1847,6 @@ impl Renderer {
         }
     }
 
-    /// Top-right `Notifs` switcher pill inside the expanded media / idle card.
-    unsafe fn draw_notifs_tab_pill(
-        &self,
-        origin_x: f32,
-        origin_y: f32,
-        unread: usize,
-        hovered: bool,
-        alpha: f32,
-    ) {
-        let rect = EXPANDED_NOTIFS_BTN;
-        let d2d_rect = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: origin_x + rect.left,
-                top: origin_y + rect.top,
-                right: origin_x + rect.right,
-                bottom: origin_y + rect.bottom,
-            },
-            radiusX: rect.height() / 2.0,
-            radiusY: rect.height() / 2.0,
-        };
-
-        let bg_alpha = if hovered { 0.20 } else { 0.10 };
-        self.hover_brush.SetOpacity(bg_alpha * alpha);
-        self.target
-            .FillRoundedRectangle(&d2d_rect, &self.hover_brush);
-
-        let label = if unread > 9 {
-            "Notifs 9+".to_string()
-        } else if unread > 0 {
-            format!("Notifs {unread}")
-        } else {
-            "Notifs".to_string()
-        };
-        let label_u16: Vec<u16> = label.encode_utf16().collect();
-        if let Ok(layout) = self.dwrite.CreateTextLayout(
-            &label_u16,
-            &self.pill_btn_format,
-            rect.width(),
-            rect.height(),
-        ) {
-            if unread > 0 {
-                self.badge_red_brush.SetOpacity(alpha);
-                let dot = D2D1_ELLIPSE {
-                    point: D2D_POINT_2F {
-                        x: origin_x + rect.left + 8.0,
-                        y: origin_y + rect.top + rect.height() / 2.0,
-                    },
-                    radiusX: 3.0,
-                    radiusY: 3.0,
-                };
-                self.target.FillEllipse(&dot, &self.badge_red_brush);
-            }
-
-            self.hud_text_brush
-                .SetOpacity(if hovered { 1.0 } else { 0.85 } * alpha);
-            self.target.DrawTextLayout(
-                D2D_POINT_2F {
-                    x: origin_x + rect.left + if unread > 0 { 4.0 } else { 0.0 },
-                    y: origin_y + rect.top,
-                },
-                &layout,
-                &self.hud_text_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
-        }
-    }
-
-    unsafe fn draw_idle_brand(
-        &self,
-        pill_left: f32,
-        pill_top: f32,
-        pill_width: f32,
-        pill_height: f32,
-        notif: &NotificationSnapshot,
-        alpha: f32,
-    ) {
-        let alpha = alpha.clamp(0.0, 1.0);
-        let dot = D2D1_ELLIPSE {
-            point: D2D_POINT_2F {
-                x: pill_left + 18.0,
-                y: pill_top + pill_height / 2.0,
-            },
-            radiusX: 4.0,
-            radiusY: 4.0,
-        };
-        self.accent_brush.SetOpacity(0.95 * alpha);
-        self.target.FillEllipse(&dot, &self.accent_brush);
-        self.accent_brush.SetOpacity(1.0);
-
-        let clock = current_clock_string();
-        let clock_u16: Vec<u16> = clock.encode_utf16().collect();
-        let unread = notif.unread_count();
-
-        if unread > 0 {
-            // [●]  10:22        [Avatar][Badge]
-            if let Ok(layout) = self.dwrite.CreateTextLayout(
-                &clock_u16,
-                &self.clock_collapsed_format,
-                68.0,
-                pill_height,
-            ) {
-                self.title_brush.SetOpacity(0.98 * alpha);
-                self.target.DrawTextLayout(
-                    D2D_POINT_2F {
-                        x: pill_left + 30.0,
-                        y: pill_top,
-                    },
-                    &layout,
-                    &self.title_brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                );
-            }
-
-            if let Some(app_name) = notif.latest_app_name() {
-                self.draw_collapsed_notification_badge(
-                    pill_left,
-                    pill_top,
-                    pill_width,
-                    pill_height,
-                    app_name,
-                    unread,
-                    alpha,
-                );
-            }
-        } else {
-            // [●] Zekrima     10:22
-            let label: Vec<u16> = "Zekrima".encode_utf16().collect();
-            if let Ok(layout) =
-                self.dwrite
-                    .CreateTextLayout(&label, &self.hud_format, 72.0, pill_height)
-            {
-                self.hud_text_brush.SetOpacity(0.82 * alpha);
-                self.target.DrawTextLayout(
-                    D2D_POINT_2F {
-                        x: pill_left + 29.0,
-                        y: pill_top + (pill_height - 16.0) / 2.0,
-                    },
-                    &layout,
-                    &self.hud_text_brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                );
-            }
-
-            if let Ok(layout) = self.dwrite.CreateTextLayout(
-                &clock_u16,
-                &self.clock_collapsed_format,
-                66.0,
-                pill_height,
-            ) {
-                self.title_brush.SetOpacity(0.98 * alpha);
-                self.target.DrawTextLayout(
-                    D2D_POINT_2F {
-                        x: pill_left + pill_width - 74.0,
-                        y: pill_top,
-                    },
-                    &layout,
-                    &self.title_brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                );
-            }
-        }
-    }
-
-    /// Expanded status card when hovering/clicking with no active media session.
-    unsafe fn draw_idle_expanded(
-        &self,
-        pill_left: f32,
-        pill_top: f32,
-        pill_width: f32,
-        pill_height: f32,
-        system: &SystemSnapshot,
-        notif: &NotificationSnapshot,
-        hovered: Option<HitTarget>,
-        alpha: f32,
-    ) {
-        let pad_x = 24.0f32;
-        let content_w = (pill_width - pad_x * 2.0).max(40.0);
-
-        // Top row: red dot + Zekrima label + Notifs tab pill
-        let dot = D2D1_ELLIPSE {
-            point: D2D_POINT_2F {
-                x: pill_left + pad_x + 4.0,
-                y: pill_top + 24.0,
-            },
-            radiusX: 4.0,
-            radiusY: 4.0,
-        };
-        self.accent_brush.SetOpacity(0.95 * alpha);
-        self.target.FillEllipse(&dot, &self.accent_brush);
-        self.accent_brush.SetOpacity(1.0);
-
-        let brand: Vec<u16> = "Zekrima".encode_utf16().collect();
-        if let Ok(layout) =
-            self.dwrite
-                .CreateTextLayout(&brand, &self.hud_format, 120.0, 20.0)
-        {
-            self.hud_text_brush.SetOpacity(0.80 * alpha);
-            self.target.DrawTextLayout(
-                D2D_POINT_2F {
-                    x: pill_left + pad_x + 15.0,
-                    y: pill_top + 16.0,
-                },
-                &layout,
-                &self.hud_text_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
-        }
-
-        self.draw_notifs_tab_pill(
-            pill_left,
-            pill_top,
-            notif.unread_count(),
-            hovered == Some(HitTarget::TabNotifications),
-            alpha,
-        );
-
-        // Hero clock (`32px` Bold) + short date & status next to it
-        let st = GetLocalTime();
-        let clock = format!("{:02}:{:02}", st.wHour, st.wMinute);
-        let clock_u16: Vec<u16> = clock.encode_utf16().collect();
-        if let Ok(layout) =
-            self.dwrite
-                .CreateTextLayout(&clock_u16, &self.clock_hero_format, 120.0, 42.0)
-        {
-            self.title_brush.SetOpacity(alpha);
-            self.target.DrawTextLayout(
-                D2D_POINT_2F {
-                    x: pill_left + pad_x,
-                    y: pill_top + 38.0,
-                },
-                &layout,
-                &self.title_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
-        }
-
-        let date_str = format_short_date(&st);
-        let sub_text = if notif.unread_count() > 0 {
-            format!(
-                "{date_str}  •  {} unread",
-                notif.unread_count()
-            )
-        } else {
-            format!("{date_str}  •  No media playing")
-        };
-        let sub: Vec<u16> = sub_text.encode_utf16().collect();
-        if let Ok(layout) =
-            self.dwrite
-                .CreateTextLayout(&sub, &self.artist_format, content_w - 118.0, 24.0)
-        {
-            self.artist_brush.SetOpacity(0.78 * alpha);
-            self.target.DrawTextLayout(
-                D2D_POINT_2F {
-                    x: pill_left + pad_x + 112.0,
-                    y: pill_top + 52.0,
-                },
-                &layout,
-                &self.artist_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
-        }
-
-        // Live system volume bar at bottom
-        let bar_y = pill_top + pill_height - 19.0;
-        let bar_h = 5.0f32;
-        let vol_label = if system.muted {
-            "Volume  •  Muted".to_string()
-        } else {
-            format!("Volume  •  {}%", (system.volume * 100.0).round() as u32)
-        };
-        let vol_u16: Vec<u16> = vol_label.encode_utf16().collect();
-        if let Ok(layout) =
-            self.dwrite
-                .CreateTextLayout(&vol_u16, &self.hud_format, content_w, 16.0)
-        {
-            self.hud_text_brush.SetOpacity(0.62 * alpha);
-            self.target.DrawTextLayout(
-                D2D_POINT_2F {
-                    x: pill_left + pad_x,
-                    y: bar_y - 17.0,
-                },
-                &layout,
-                &self.hud_text_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
-        }
-
-        let track = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: pill_left + pad_x,
-                top: bar_y,
-                right: pill_left + pad_x + content_w,
-                bottom: bar_y + bar_h,
-            },
-            radiusX: bar_h / 2.0,
-            radiusY: bar_h / 2.0,
-        };
-        self.hud_track_brush.SetOpacity(alpha);
-        self.target
-            .FillRoundedRectangle(&track, &self.hud_track_brush);
-
-        let fill_w = (content_w * system.volume.clamp(0.0, 1.0))
-            .max(if system.volume > 0.001 { bar_h } else { 0.0 });
-        if fill_w > 0.0 {
-            let fill = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left: pill_left + pad_x,
-                    top: bar_y,
-                    right: pill_left + pad_x + fill_w,
-                    bottom: bar_y + bar_h,
-                },
-                radiusX: bar_h / 2.0,
-                radiusY: bar_h / 2.0,
-            };
-            self.hud_fill_brush
-                .SetOpacity(if system.muted { 0.30 } else { 0.85 } * alpha);
-            self.target
-                .FillRoundedRectangle(&fill, &self.hud_fill_brush);
-        }
-    }
-
-    /// Pillar-style incoming notification toast with colored avatar, accent app
-    /// name, dismiss `×` button, and shrinking bottom progress bar.
     unsafe fn draw_notification_toast(
         &self,
         pill_left: f32,
@@ -1415,7 +1857,6 @@ impl Renderer {
     ) {
         let (ar, ag, ab) = app_accent_rgb(&item.app);
 
-        // App avatar (rounded square with soft accent fill & border)
         let avatar_rect = D2D1_ROUNDED_RECT {
             rect: D2D_RECT_F {
                 left: pill_left + TOAST_AVATAR.left,
@@ -1443,8 +1884,7 @@ impl Renderer {
         self.target
             .DrawRoundedRectangle(&avatar_rect, &self.dynamic_brush, 1.0, None);
 
-        let initial = app_initial(&item.app);
-        let init_u16: Vec<u16> = initial.encode_utf16().collect();
+        let init_u16: Vec<u16> = app_initial(&item.app).encode_utf16().collect();
         if let Ok(layout) = self.dwrite.CreateTextLayout(
             &init_u16,
             &self.badge_format,
@@ -1463,7 +1903,6 @@ impl Renderer {
             );
         }
 
-        // App name (in app accent color) + "just now"
         let text_left = pill_left + 64.0;
         let text_w = (TOAST_DISMISS_BTN.left - 68.0).max(60.0);
         let header = format!("{}  •  just now", item.app);
@@ -1489,7 +1928,6 @@ impl Renderer {
             );
         }
 
-        // Title
         let title_str = if item.title.is_empty() {
             "Notification"
         } else {
@@ -1515,15 +1953,13 @@ impl Renderer {
             );
         }
 
-        // Body (up to 2 lines)
         if !item.body.is_empty() {
-            let body_w = text_w + 18.0;
             if let Ok(layout) = create_layout(
                 &self.dwrite,
                 &self.notif_body_format,
                 &self.notif_body_trim,
                 &item.body,
-                body_w,
+                text_w + 18.0,
                 30.0,
             ) {
                 self.notif_body_brush.SetOpacity(1.0);
@@ -1539,11 +1975,14 @@ impl Renderer {
             }
         }
 
-        // Dismiss `×` button
-        let dismiss_hovered = hovered == Some(HitTarget::ToastDismiss(item.id));
-        self.draw_dismiss_x(pill_left, pill_top, TOAST_DISMISS_BTN, dismiss_hovered, 1.0);
+        self.draw_dismiss_x(
+            pill_left,
+            pill_top,
+            TOAST_DISMISS_BTN,
+            hovered == Some(HitTarget::ToastDismiss(item.id)),
+            1.0,
+        );
 
-        // Shrinking auto-dismiss progress bar along the bottom edge
         let bar_w = TOAST_PROGRESS_RECT.width() * progress.clamp(0.0, 1.0);
         if bar_w > 1.0 {
             let bar = D2D1_ROUNDED_RECT {
@@ -1566,7 +2005,6 @@ impl Renderer {
         }
     }
 
-    /// Pillar-style expanded Notifications panel (header + cards or access prompt).
     unsafe fn draw_notifications_panel(
         &self,
         pill_left: f32,
@@ -1577,19 +2015,6 @@ impl Renderer {
         alpha: f32,
     ) {
         let unread = notif.unread_count();
-
-        // Header: red/white indicator + "Notifications" + count badge
-        let dot = D2D1_ELLIPSE {
-            point: D2D_POINT_2F {
-                x: pill_left + 22.0,
-                y: pill_top + 24.0,
-            },
-            radiusX: 4.0,
-            radiusY: 4.0,
-        };
-        self.badge_red_brush.SetOpacity(alpha);
-        self.target.FillEllipse(&dot, &self.badge_red_brush);
-
         let header_text = if unread > NOTIF_CARD_MAX_VISIBLE {
             format!(
                 "Notifications ({unread})  •  +{} more",
@@ -1603,36 +2028,21 @@ impl Renderer {
         let header_u16: Vec<u16> = header_text.encode_utf16().collect();
         if let Ok(layout) =
             self.dwrite
-                .CreateTextLayout(&header_u16, &self.hud_format, 240.0, 20.0)
+                .CreateTextLayout(&header_u16, &self.hud_format, 260.0, 18.0)
         {
-            self.title_brush.SetOpacity(0.95 * alpha);
+            self.hud_text_brush.SetOpacity(0.84 * alpha);
             self.target.DrawTextLayout(
                 D2D_POINT_2F {
-                    x: pill_left + 34.0,
-                    y: pill_top + 16.0,
+                    x: pill_left + 20.0,
+                    y: pill_top + 41.0,
                 },
                 &layout,
-                &self.title_brush,
+                &self.hud_text_brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
             );
         }
 
-        // Header action pills: "Media" and (if items exist) "Clear all"
-        let has_items = !notif.items.is_empty();
-        let media_btn = if has_items {
-            NOTIF_MEDIA_TAB_BTN
-        } else {
-            NOTIF_MEDIA_TAB_BTN_RIGHT
-        };
-        self.draw_action_pill(
-            pill_left,
-            pill_top,
-            media_btn,
-            "Media",
-            hovered == Some(HitTarget::TabMedia),
-            alpha,
-        );
-        if has_items {
+        if !notif.items.is_empty() {
             self.draw_action_pill(
                 pill_left,
                 pill_top,
@@ -1643,7 +2053,7 @@ impl Renderer {
             );
         }
 
-        if !notif.access_granted {
+        if !notif.access_granted && notif.items.is_empty() {
             let msg1: Vec<u16> = "Notification access required".encode_utf16().collect();
             if let Ok(layout) = self.dwrite.CreateTextLayout(
                 &msg1,
@@ -1655,7 +2065,7 @@ impl Renderer {
                 self.target.DrawTextLayout(
                     D2D_POINT_2F {
                         x: pill_left + 16.0,
-                        y: pill_top + 58.0,
+                        y: pill_top + 66.0,
                     },
                     &layout,
                     &self.title_brush,
@@ -1677,7 +2087,7 @@ impl Renderer {
                 self.target.DrawTextLayout(
                     D2D_POINT_2F {
                         x: pill_left + 16.0,
-                        y: pill_top + 80.0,
+                        y: pill_top + 88.0,
                     },
                     &layout,
                     &self.artist_brush,
@@ -1735,7 +2145,7 @@ impl Renderer {
                 self.target.DrawTextLayout(
                     D2D_POINT_2F {
                         x: pill_left + 16.0,
-                        y: pill_top + 74.0,
+                        y: pill_top + 82.0,
                     },
                     &layout,
                     &self.title_brush,
@@ -1754,7 +2164,7 @@ impl Renderer {
                 self.target.DrawTextLayout(
                     D2D_POINT_2F {
                         x: pill_left + 16.0,
-                        y: pill_top + 98.0,
+                        y: pill_top + 106.0,
                     },
                     &layout,
                     &self.artist_brush,
@@ -1764,7 +2174,6 @@ impl Renderer {
             return;
         }
 
-        // Draw up to 2 sleek Pillar-style NotificationCards
         for (index, item) in notif
             .items
             .iter()
@@ -1783,27 +2192,26 @@ impl Renderer {
                     right: pill_left + card.right,
                     bottom: pill_top + card.bottom,
                 },
-                radiusX: 12.0,
-                radiusY: 12.0,
+                radiusX: 10.0,
+                radiusY: 10.0,
             };
             self.hover_brush
                 .SetOpacity(if card_hovered { 0.11 } else { 0.055 } * alpha);
             self.target
                 .FillRoundedRectangle(&card_d2d, &self.hover_brush);
 
-            // Colored app avatar (26x26 rounded square)
             let (ar, ag, ab) = app_accent_rgb(&item.app);
-            let av_left = pill_left + card.left + 10.0;
-            let av_top = pill_top + card.top + 12.0;
+            let av_left = pill_left + card.left + 8.0;
+            let av_top = pill_top + card.top + 8.0;
             let av_rect = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
                     left: av_left,
                     top: av_top,
-                    right: av_left + 26.0,
-                    bottom: av_top + 26.0,
+                    right: av_left + 25.0,
+                    bottom: av_top + 25.0,
                 },
-                radiusX: 7.0,
-                radiusY: 7.0,
+                radiusX: 6.0,
+                radiusY: 6.0,
             };
             self.dynamic_brush.SetColor(&D2D1_COLOR_F {
                 r: ar,
@@ -1817,7 +2225,7 @@ impl Renderer {
             let init_u16: Vec<u16> = app_initial(&item.app).encode_utf16().collect();
             if let Ok(layout) =
                 self.dwrite
-                    .CreateTextLayout(&init_u16, &self.badge_format, 26.0, 26.0)
+                    .CreateTextLayout(&init_u16, &self.badge_format, 25.0, 25.0)
             {
                 self.title_brush.SetOpacity(alpha);
                 self.target.DrawTextLayout(
@@ -1828,17 +2236,13 @@ impl Renderer {
                 );
             }
 
-            // Text column
-            let tx = pill_left + card.left + 44.0;
-            let tw = (dismiss_rect.left - (card.left + 48.0)).max(60.0);
-
-            // Row 1: App name + relative time
-            let rel = format_relative_time(item.timestamp_ms);
-            let meta = format!("{}  •  {}", item.app, rel);
+            let tx = pill_left + card.left + 40.0;
+            let tw = (dismiss_rect.left - (card.left + 44.0)).max(60.0);
+            let meta = format!("{}  •  {}", item.app, format_relative_time(item.timestamp_ms));
             let meta_u16: Vec<u16> = meta.encode_utf16().collect();
             if let Ok(layout) =
                 self.dwrite
-                    .CreateTextLayout(&meta_u16, &self.notif_app_format, tw, 15.0)
+                    .CreateTextLayout(&meta_u16, &self.notif_app_format, tw, 14.0)
             {
                 self.dynamic_brush.SetColor(&D2D1_COLOR_F {
                     r: ar,
@@ -1849,7 +2253,7 @@ impl Renderer {
                 self.target.DrawTextLayout(
                     D2D_POINT_2F {
                         x: tx,
-                        y: pill_top + card.top + 6.0,
+                        y: pill_top + card.top + 4.0,
                     },
                     &layout,
                     &self.dynamic_brush,
@@ -1857,7 +2261,6 @@ impl Renderer {
                 );
             }
 
-            // Row 2: Title + inline body snippet
             let line2 = if item.body.is_empty() {
                 item.title.clone()
             } else if item.title.is_empty() {
@@ -1871,13 +2274,13 @@ impl Renderer {
                 &self.notif_title_trim,
                 &line2,
                 tw,
-                19.0,
+                18.0,
             ) {
                 self.notif_title_brush.SetOpacity(0.94 * alpha);
                 self.target.DrawTextLayout(
                     D2D_POINT_2F {
                         x: tx,
-                        y: pill_top + card.top + 23.0,
+                        y: pill_top + card.top + 19.0,
                     },
                     &layout,
                     &self.notif_title_brush,
@@ -1921,7 +2324,7 @@ impl Renderer {
             rect.height(),
         ) {
             self.hud_text_brush
-                .SetOpacity(if hovered { 1.0 } else { 0.80 } * alpha);
+                .SetOpacity(if hovered { 1.0 } else { 0.82 } * alpha);
             self.target.DrawTextLayout(
                 D2D_POINT_2F {
                     x: origin_x + rect.left,
@@ -1949,14 +2352,14 @@ impl Renderer {
         if hovered {
             let circle = D2D1_ELLIPSE {
                 point: D2D_POINT_2F { x, y },
-                radiusX: 11.0,
-                radiusY: 11.0,
+                radiusX: 10.5,
+                radiusY: 10.5,
             };
             self.hover_brush.SetOpacity(0.16 * alpha);
             self.target.FillEllipse(&circle, &self.hover_brush);
         }
 
-        let r = 4.0;
+        let r = 3.8;
         self.icon_brush
             .SetOpacity(if hovered { 0.92 } else { 0.45 } * alpha);
         self.target.DrawLine(
@@ -2007,10 +2410,7 @@ impl Renderer {
         {
             self.hud_text_brush.SetOpacity(0.92);
             self.target.DrawTextLayout(
-                D2D_POINT_2F {
-                    x: bar_x,
-                    y: label_y,
-                },
+                D2D_POINT_2F { x: bar_x, y: label_y },
                 &layout,
                 &self.hud_text_brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -2024,10 +2424,7 @@ impl Renderer {
         {
             self.hud_text_brush.SetOpacity(0.75);
             self.target.DrawTextLayout(
-                D2D_POINT_2F {
-                    x: bar_x,
-                    y: label_y,
-                },
+                D2D_POINT_2F { x: bar_x, y: label_y },
                 &layout,
                 &self.hud_text_brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
@@ -2072,10 +2469,8 @@ impl Renderer {
         if media.art_revision == self.art_revision {
             return;
         }
-
         self.art_revision = media.art_revision;
         self.art_bitmap = None;
-
         if let Some(art) = &media.album_art {
             if let Ok(bitmap) = self.create_art_bitmap(art) {
                 self.art_bitmap = Some(bitmap);
@@ -2092,7 +2487,6 @@ impl Renderer {
             dpiX: 96.0,
             dpiY: 96.0,
         };
-
         self.target.CreateBitmap(
             D2D_SIZE_U {
                 width: art.width,
@@ -2115,7 +2509,6 @@ impl Renderer {
         if title == self.cached_title && artist == self.cached_artist {
             return;
         }
-
         self.cached_title = title.to_owned();
         self.cached_artist = artist.to_owned();
 
@@ -2231,6 +2624,24 @@ impl Drop for Renderer {
         unsafe {
             self.release_surface();
         }
+    }
+}
+
+fn metric_bar_color(frac: f32, is_battery: bool) -> (f32, f32, f32) {
+    if is_battery {
+        if frac < 0.20 {
+            (239.0 / 255.0, 68.0 / 255.0, 68.0 / 255.0) // red
+        } else if frac < 0.40 {
+            (245.0 / 255.0, 158.0 / 255.0, 11.0 / 255.0) // amber
+        } else {
+            (34.0 / 255.0, 197.0 / 255.0, 94.0 / 255.0) // green
+        }
+    } else if frac > 0.85 {
+        (235.0 / 255.0, 0.0, 40.0 / 255.0) // crimson
+    } else if frac > 0.60 {
+        (245.0 / 255.0, 158.0 / 255.0, 11.0 / 255.0) // amber
+    } else {
+        (34.0 / 255.0, 197.0 / 255.0, 94.0 / 255.0) // green
     }
 }
 

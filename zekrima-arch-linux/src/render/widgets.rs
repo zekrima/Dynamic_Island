@@ -1,13 +1,14 @@
-//! Shared widget geometry, Pillar-style notification layout, and hit-targets.
+//! Shared widget geometry, 5-tab navigation bar, Pillar notifications,
+//! Pomodoro timer, Clipboard history, System Monitor, and hit-targets.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::render::spring::{
-    COLLAPSED_HEIGHT, EXPANDED_HEIGHT, EXPANDED_NOTIFS_WIDTH, EXPANDED_WIDTH,
-    NOTIFICATION_HEIGHT, NOTIFICATION_WIDTH,
+    COLLAPSED_HEIGHT, EXPANDED_HEIGHT, EXPANDED_WIDTH, NOTIFICATION_HEIGHT, NOTIFICATION_WIDTH,
 };
 use crate::services::media::MediaControl;
 use crate::services::notifications::NotificationSnapshot;
+use crate::services::pomodoro::TIMER_PRESETS_SECS;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RectF {
@@ -45,55 +46,69 @@ impl RectF {
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.left && x < self.right && y >= self.top && y < self.bottom
     }
-
-    pub fn lerp(&self, other: &RectF, t: f32) -> RectF {
-        RectF {
-            left: lerp(self.left, other.left, t),
-            top: lerp(self.top, other.top, t),
-            right: lerp(self.right, other.right, t),
-            bottom: lerp(self.bottom, other.bottom, t),
-        }
-    }
-}
-
-pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExpandedTab {
     Media,
+    Timer,
+    Clipboard,
+    System,
     Notifications,
 }
 
+pub const ALL_TABS: [ExpandedTab; 5] = [
+    ExpandedTab::Media,
+    ExpandedTab::Timer,
+    ExpandedTab::Clipboard,
+    ExpandedTab::System,
+    ExpandedTab::Notifications,
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HitTarget {
+    SelectTab(ExpandedTab),
     MediaControl(MediaControl),
     ToastDismiss(u32),
     ToastClear(u32),
-    TabMedia,
-    TabNotifications,
     ClearAllNotifications,
     NotifDismiss(u32),
+    TimerToggle,
+    TimerReset,
+    TimerPreset(u32),
+    ClipCopy(usize),
+    ClipClear,
+}
+
+pub fn tab_rect(tab: ExpandedTab) -> RectF {
+    let idx = match tab {
+        ExpandedTab::Media => 0.0,
+        ExpandedTab::Timer => 1.0,
+        ExpandedTab::Clipboard => 2.0,
+        ExpandedTab::System => 3.0,
+        ExpandedTab::Notifications => 4.0,
+    };
+    let pad = 16.0;
+    let gap = 6.0;
+    let tab_w = (EXPANDED_WIDTH - pad * 2.0 - gap * 4.0) / 5.0;
+    let left = pad + idx * (tab_w + gap);
+    RectF::new(left, 11.0, left + tab_w, 33.0)
 }
 
 pub const COLLAPSED_ART: RectF = RectF::new(10.0, 7.0, 30.0, 27.0);
-pub const EXPANDED_ART: RectF = RectF::new(16.0, 24.0, 88.0, 96.0);
+pub const EXPANDED_ART: RectF = RectF::new(18.0, 48.0, 102.0, 132.0);
 
-pub const TITLE_BOX: RectF = RectF::new(104.0, 15.0, 344.0, 43.0);
-pub const ARTIST_BOX: RectF = RectF::new(104.0, 43.0, 422.0, 67.0);
+pub const TITLE_BOX: RectF = RectF::new(116.0, 46.0, 422.0, 74.0);
+pub const ARTIST_BOX: RectF = RectF::new(116.0, 74.0, 422.0, 96.0);
 
 pub const CONTROL_SIZE: f32 = 30.0;
 pub const CONTROL_GAP: f32 = 8.0;
-pub const CONTROLS_TOP: f32 = 76.0;
+pub const CONTROLS_TOP: f32 = 104.0;
 
 pub const EQUALIZER_BAR_COUNT: usize = 5;
 pub const EQUALIZER_BAR_WIDTH: f32 = 3.0;
 pub const EQUALIZER_BAR_GAP: f32 = 2.5;
 pub const EQUALIZER_RIGHT: f32 = 164.0;
-
-pub const EXPANDED_NOTIFS_BTN: RectF =
-    RectF::new(EXPANDED_WIDTH - 88.0, 14.0, EXPANDED_WIDTH - 16.0, 36.0);
 
 pub const TOAST_AVATAR: RectF = RectF::new(16.0, 22.0, 52.0, 58.0);
 pub const TOAST_DISMISS_BTN: RectF =
@@ -106,36 +121,46 @@ pub const TOAST_PROGRESS_RECT: RectF = RectF::new(
 );
 
 pub const NOTIF_CARD_MAX_VISIBLE: usize = 2;
-pub const NOTIF_CLEAR_BTN: RectF = RectF::new(
-    EXPANDED_NOTIFS_WIDTH - 78.0,
-    13.0,
-    EXPANDED_NOTIFS_WIDTH - 16.0,
-    35.0,
-);
-pub const NOTIF_MEDIA_TAB_BTN: RectF = RectF::new(
-    EXPANDED_NOTIFS_WIDTH - 146.0,
-    13.0,
-    EXPANDED_NOTIFS_WIDTH - 84.0,
-    35.0,
-);
-pub const NOTIF_MEDIA_TAB_BTN_RIGHT: RectF = NOTIF_CLEAR_BTN;
+pub const NOTIF_CLEAR_BTN: RectF =
+    RectF::new(EXPANDED_WIDTH - 80.0, 40.0, EXPANDED_WIDTH - 16.0, 58.0);
 
 pub fn notif_card_rect(index: usize) -> RectF {
-    let top = 42.0 + index as f32 * 56.0;
-    RectF::new(16.0, top, EXPANDED_NOTIFS_WIDTH - 16.0, top + 50.0)
+    let top = 64.0 + index as f32 * 45.0;
+    RectF::new(16.0, top, EXPANDED_WIDTH - 16.0, top + 41.0)
 }
 
 pub fn notif_card_dismiss_rect(index: usize) -> RectF {
     let card = notif_card_rect(index);
     RectF::new(
-        card.right - 30.0,
+        card.right - 28.0,
         card.top + 8.0,
         card.right - 6.0,
-        card.top + 32.0,
+        card.top + 30.0,
     )
 }
 
-const CONTROLS_ACTIVE_HEIGHT: f32 = EXPANDED_HEIGHT - 8.0;
+pub const TIMER_TOGGLE_BTN: RectF = RectF::new(248.0, 52.0, 334.0, 82.0);
+pub const TIMER_RESET_BTN: RectF = RectF::new(342.0, 52.0, 422.0, 82.0);
+pub const TIMER_PROGRESS_BAR: RectF = RectF::new(20.0, 144.0, 420.0, 150.0);
+
+pub fn timer_preset_rect(index: usize) -> RectF {
+    let pad = 20.0;
+    let gap = 10.0;
+    let w = (EXPANDED_WIDTH - pad * 2.0 - gap * 3.0) / 4.0;
+    let left = pad + index as f32 * (w + gap);
+    RectF::new(left, 110.0, left + w, 134.0)
+}
+
+pub const CLIP_MAX_VISIBLE: usize = 3;
+pub const CLIP_CLEAR_BTN: RectF =
+    RectF::new(EXPANDED_WIDTH - 72.0, 40.0, EXPANDED_WIDTH - 16.0, 58.0);
+
+pub fn clip_row_rect(index: usize) -> RectF {
+    let top = 64.0 + index as f32 * 30.0;
+    RectF::new(16.0, top, EXPANDED_WIDTH - 16.0, top + 26.0)
+}
+
+const CONTROLS_ACTIVE_HEIGHT: f32 = EXPANDED_HEIGHT - 12.0;
 
 pub fn control_rect(control: MediaControl) -> RectF {
     let index = match control {
@@ -183,6 +208,7 @@ pub struct HitContext<'a> {
     pub hud_visible: bool,
     pub toast_visible: bool,
     pub notifications: &'a NotificationSnapshot,
+    pub clip_count: usize,
 }
 
 pub fn hit_target_at(x: f32, y: f32, ctx: &HitContext) -> Option<HitTarget> {
@@ -204,11 +230,14 @@ pub fn hit_target_at(x: f32, y: f32, ctx: &HitContext) -> Option<HitTarget> {
         return None;
     }
 
+    for tab in ALL_TABS {
+        if tab_rect(tab).contains(x, y) {
+            return Some(HitTarget::SelectTab(tab));
+        }
+    }
+
     match ctx.expanded_tab {
         ExpandedTab::Media => {
-            if EXPANDED_NOTIFS_BTN.contains(x, y) {
-                return Some(HitTarget::TabNotifications);
-            }
             if ctx.has_media {
                 if let Some(ctrl) = control_at(x, y) {
                     return Some(HitTarget::MediaControl(ctrl));
@@ -216,20 +245,36 @@ pub fn hit_target_at(x: f32, y: f32, ctx: &HitContext) -> Option<HitTarget> {
             }
             None
         }
+        ExpandedTab::Timer => {
+            if TIMER_TOGGLE_BTN.contains(x, y) {
+                return Some(HitTarget::TimerToggle);
+            }
+            if TIMER_RESET_BTN.contains(x, y) {
+                return Some(HitTarget::TimerReset);
+            }
+            for (i, &secs) in TIMER_PRESETS_SECS.iter().enumerate() {
+                if timer_preset_rect(i).contains(x, y) {
+                    return Some(HitTarget::TimerPreset(secs));
+                }
+            }
+            None
+        }
+        ExpandedTab::Clipboard => {
+            if ctx.clip_count > 0 && CLIP_CLEAR_BTN.contains(x, y) {
+                return Some(HitTarget::ClipClear);
+            }
+            for i in 0..ctx.clip_count.min(CLIP_MAX_VISIBLE) {
+                if clip_row_rect(i).contains(x, y) {
+                    return Some(HitTarget::ClipCopy(i));
+                }
+            }
+            None
+        }
+        ExpandedTab::System => None,
         ExpandedTab::Notifications => {
-            let has_items = !ctx.notifications.items.is_empty();
-            if has_items && NOTIF_CLEAR_BTN.contains(x, y) {
+            if !ctx.notifications.items.is_empty() && NOTIF_CLEAR_BTN.contains(x, y) {
                 return Some(HitTarget::ClearAllNotifications);
             }
-            let media_btn = if has_items {
-                NOTIF_MEDIA_TAB_BTN
-            } else {
-                NOTIF_MEDIA_TAB_BTN_RIGHT
-            };
-            if media_btn.contains(x, y) {
-                return Some(HitTarget::TabMedia);
-            }
-
             for (index, item) in ctx
                 .notifications
                 .items

@@ -46,10 +46,13 @@ use crate::render::d2d::{Frame, Renderer};
 use crate::render::spring::{PillMode, PillSprings};
 use crate::render::widgets::{ExpandedTab, HitContext, HitTarget};
 use crate::services::audio_viz::AudioVisualizer;
+use crate::services::clipboard::{ClipboardHistory, WM_CLIPBOARDUPDATE};
 use crate::services::media::{MediaInfo, MediaService, WM_MEDIA_UPDATED};
 use crate::services::notifications::{
     NotificationService, NotificationSnapshot, WM_NOTIFICATION_UPDATED,
 };
+use crate::services::pomodoro::PomodoroTimer;
+use crate::services::sysmon::SystemMonitor;
 use crate::services::system::{SystemService, SystemSnapshot, WM_SYSTEM_UPDATED};
 use crate::tray::{
     Tray, IDM_EXIT, IDM_NOTIF_SETTINGS, IDM_RESET, IDM_STARTUP, WM_TRAY_COMMAND,
@@ -94,6 +97,9 @@ struct App {
     system_snapshot: SystemSnapshot,
     notifications: NotificationService,
     notification_snapshot: NotificationSnapshot,
+    timer: PomodoroTimer,
+    clipboard: ClipboardHistory,
+    sysmon: SystemMonitor,
     last_clock_minute: (u16, u16),
     expanded: bool,
     expanded_tab: ExpandedTab,
@@ -117,6 +123,9 @@ impl App {
         let system_snapshot = system.snapshot();
         let notifications = NotificationService::start(host.hwnd());
         let notification_snapshot = notifications.snapshot();
+        let clipboard = ClipboardHistory::new(host.hwnd());
+        let mut sysmon = SystemMonitor::new();
+        sysmon.sample();
         let renderer = Renderer::new(host.width_px(), host.height_px(), host.dpi() as f32)?;
 
         let tray = Tray::new(host.hwnd())?;
@@ -142,6 +151,9 @@ impl App {
             system_snapshot,
             notifications,
             notification_snapshot,
+            timer: PomodoroTimer::default(),
+            clipboard,
+            sysmon,
             last_clock_minute: (st.wHour, st.wMinute),
             expanded: false,
             expanded_tab: ExpandedTab::Media,
@@ -175,6 +187,10 @@ impl App {
             eq_levels: self.audio_viz.levels(),
             system: &self.system_snapshot,
             notification: &self.notification_snapshot,
+            timer: &self.timer,
+            clip_items: &self.clipboard.items,
+            clip_copied_flash: self.clipboard.is_copied_flash_active(),
+            sys_stats: &self.sysmon.stats,
         };
         self.renderer.render(self.host.hwnd(), &frame)
     }
@@ -189,11 +205,10 @@ impl App {
             hud_visible: self.hud_visible(),
             toast_visible: self.toast_visible(),
             notifications: &self.notification_snapshot,
+            clip_count: self.clipboard.items.len(),
         }
     }
 
-    /// Real-time audio visualizer bars animate while music is actively playing
-    /// (both in the collapsed pill and the expanded media card).
     fn equalizer_active(&self) -> bool {
         self.media_info.has_session
             && self.media_info.is_playing
@@ -202,8 +217,6 @@ impl App {
             && (!self.expanded || self.expanded_tab == ExpandedTab::Media)
     }
 
-    /// The 60 fps toast countdown progress bar animates only during the ~3.8 s
-    /// incoming toast, then stops completely when absorbed into the badge.
     fn toast_progress_active(&self) -> bool {
         self.toast_visible() && !self.expanded && !self.hud_visible()
     }
@@ -215,14 +228,9 @@ impl App {
 
         self.expanded = expanded;
         if expanded {
-            // Smart default tab: if notifications exist and no media is active,
-            // open straight to the Notifications list like Pillar.
-            self.expanded_tab =
-                if !self.media_info.has_session && self.notification_snapshot.unread_count() > 0 {
-                    ExpandedTab::Notifications
-                } else {
-                    ExpandedTab::Media
-                };
+            if self.expanded_tab == ExpandedTab::System {
+                self.sysmon.sample();
+            }
         } else {
             self.hovered_target = None;
         }
@@ -236,6 +244,9 @@ impl App {
         }
         self.expanded_tab = tab;
         self.hovered_target = None;
+        if tab == ExpandedTab::System {
+            self.sysmon.sample();
+        }
         self.apply_pill_mode();
         self.update_timer();
         let _ = self.render();
@@ -300,15 +311,60 @@ impl App {
         let _ = self.render();
     }
 
-    /// Refreshes the displayed clock whenever the local minute rolls over.
-    unsafe fn on_clock_tick(&mut self) {
+    /// 1-second housekeeping: minute clock refresh, Pomodoro tick, on-demand SysMon sample.
+    unsafe fn on_one_second_tick(&mut self) {
+        let mut needs_render = false;
+
+        // 1. Local minute clock rollover
         let st = GetLocalTime();
         let current = (st.wHour, st.wMinute);
         if current != self.last_clock_minute {
             self.last_clock_minute = current;
-            if !self.timer_running {
-                let _ = self.render();
+            needs_render = true;
+        }
+
+        // 2. Pomodoro timer countdown (only when actively running)
+        if self.timer.running {
+            let finished = self.timer.tick();
+            needs_render = true;
+            if finished {
+                self.apply_pill_mode();
+                self.notifications.push_local_toast(
+                    "Pomodoro",
+                    "Focus Session Complete!",
+                    "Time's up — take a short break.",
+                );
             }
+        }
+
+        // 3. System Monitor (ONLY sampled while user is looking at the Sys tab -> 0% idle CPU)
+        if self.expanded && self.expanded_tab == ExpandedTab::System {
+            self.sysmon.sample();
+            needs_render = true;
+        }
+
+        // 4. Clear "Copied!" flash cleanly after ~1.4s
+        if self.expanded
+            && self.expanded_tab == ExpandedTab::Clipboard
+            && self.clipboard.copied_flash_until.is_some()
+            && !self.clipboard.is_copied_flash_active()
+        {
+            self.clipboard.copied_flash_until = None;
+            needs_render = true;
+        }
+
+        if needs_render && !self.timer_running {
+            let _ = self.render();
+        }
+    }
+
+    unsafe fn on_clipboard_update(&mut self) {
+        if self.clipboard.on_clipboard_update()
+            && self.expanded
+            && self.expanded_tab == ExpandedTab::Clipboard
+            && !self.timer_running
+        {
+            let _ = self.render();
         }
     }
 
@@ -353,12 +409,10 @@ impl App {
     unsafe fn on_hud_timer(&mut self) {
         let _ = KillTimer(self.host.hwnd(), TIMER_HUD_HIDE);
         self.system_snapshot = self.system.snapshot();
-
         if self.hud_visible() {
             self.schedule_hud_hide();
             return;
         }
-
         self.apply_pill_mode();
         self.update_timer();
         let _ = self.render();
@@ -367,13 +421,10 @@ impl App {
     unsafe fn on_notif_timer(&mut self) {
         let _ = KillTimer(self.host.hwnd(), TIMER_NOTIF_HIDE);
         self.notification_snapshot = self.notifications.snapshot();
-
         if self.toast_visible() {
             self.schedule_notif_hide();
             return;
         }
-
-        // Toast finished its ~3.8 s display -> smoothly absorb into collapsed badge!
         self.apply_pill_mode();
         self.update_timer();
         let _ = self.render();
@@ -391,10 +442,7 @@ impl App {
         let mode = if self.hud_visible() {
             PillMode::Hud
         } else if self.expanded {
-            match self.expanded_tab {
-                ExpandedTab::Media => PillMode::Expanded,
-                ExpandedTab::Notifications => PillMode::ExpandedNotifications,
-            }
+            PillMode::Expanded
         } else if self.toast_visible() {
             PillMode::Notification
         } else if self.notification_snapshot.unread_count() > 0 {
@@ -418,15 +466,14 @@ impl App {
 
         if !self.hovered {
             self.hovered = true;
-            // Don't interrupt an active incoming toast with auto-expand so the
-            // user can directly click the toast or its `×` dismiss button.
             if !self.toast_visible() {
                 self.set_expanded(true);
             }
         }
 
         let ctx = self.hit_context();
-        let target = hit_test::target_at_cursor(self.host.hwnd(), self.host.dpi(), &self.springs, &ctx);
+        let target =
+            hit_test::target_at_cursor(self.host.hwnd(), self.host.dpi(), &self.springs, &ctx);
         if target != self.hovered_target {
             self.hovered_target = target;
             if !self.timer_running {
@@ -446,6 +493,9 @@ impl App {
         let ctx = self.hit_context();
         if let Some(target) = hit_test::target_at(lparam, self.host.dpi(), &self.springs, &ctx) {
             match target {
+                HitTarget::SelectTab(tab) => {
+                    self.set_expanded_tab(tab);
+                }
                 HitTarget::MediaControl(control) => {
                     self.media.control(control);
                 }
@@ -454,12 +504,6 @@ impl App {
                 }
                 HitTarget::ToastDismiss(id) => {
                     self.notifications.dismiss(id);
-                }
-                HitTarget::TabMedia => {
-                    self.set_expanded_tab(ExpandedTab::Media);
-                }
-                HitTarget::TabNotifications => {
-                    self.set_expanded_tab(ExpandedTab::Notifications);
                 }
                 HitTarget::ClearAllNotifications => {
                     self.notifications.clear_all();
@@ -472,6 +516,26 @@ impl App {
                 }
                 HitTarget::NotifDismiss(id) => {
                     self.notifications.dismiss(id);
+                }
+                HitTarget::TimerToggle => {
+                    self.timer.toggle_start_pause();
+                    let _ = self.render();
+                }
+                HitTarget::TimerReset => {
+                    self.timer.reset();
+                    let _ = self.render();
+                }
+                HitTarget::TimerPreset(secs) => {
+                    self.timer.select_preset(secs);
+                    let _ = self.render();
+                }
+                HitTarget::ClipCopy(index) => {
+                    self.clipboard.copy_item(index);
+                    let _ = self.render();
+                }
+                HitTarget::ClipClear => {
+                    self.clipboard.clear();
+                    let _ = self.render();
                 }
             }
             return;
@@ -598,6 +662,10 @@ unsafe extern "system" fn wndproc(
                 DefWindowProcW(hwnd, message, wparam, lparam)
             }
         }
+        WM_CLIPBOARDUPDATE => {
+            with_app_mut(|app| app.on_clipboard_update());
+            LRESULT(0)
+        }
         WM_INPUT => {
             handle_raw_input(lparam);
             DefWindowProcW(hwnd, message, wparam, lparam)
@@ -647,7 +715,7 @@ unsafe extern "system" fn wndproc(
         WM_TIMER if wparam.0 == TIMER_FULLSCREEN_CHECK => {
             let _ = with_app_mut(|app| {
                 let _ = app.fullscreen_monitor.check_and_react();
-                app.on_clock_tick();
+                app.on_one_second_tick();
             });
             LRESULT(0)
         }
@@ -862,7 +930,6 @@ unsafe fn run() -> Result<()> {
     CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
     let _apartment = ComApartment;
 
-    // Single-instance guard: prevent multiple islands from running simultaneously.
     let mutex_name = w!("Global\\ZekrimaSingleInstanceMutex");
     if let Ok(mutex) = windows::Win32::System::Threading::CreateMutexW(None, false, mutex_name) {
         if windows::Win32::Foundation::GetLastError()

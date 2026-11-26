@@ -1,13 +1,8 @@
 //! Zekrima — Native Dynamic Island overlay for Arch Linux / CachyOS.
 //!
-//! Built directly on GTK4 + `gtk4-layer-shell` (Wayland `zwlr_layer_shell_v1`
-//! overlay with X11 fallback) + Cairo/PangoCairo.
-//! - Anchored top-center on `Layer::Overlay`, `KeyboardMode::None` (never
-//!   steals keyboard focus), `exclusive_zone(0)`.
-//! - Per-pixel transparency + dynamic `GdkSurface::set_input_region` so clicks
-//!   outside the animated pill pass straight through to windows underneath.
-//! - Zero continuous loop when idle: the 16 ms animation timer stops as soon as
-//!   springs settle and neither equalizer nor toast countdown is active.
+//! GTK4 + `gtk4-layer-shell` + Cairo/PangoCairo with full v0.2.0 productivity
+//! suite: Media + PipeWire FFT visualizer, Pomodoro Timer, Clipboard History,
+//! on-demand System Monitor, Pillar-style D-Bus Notifications, and HUD.
 
 mod layout;
 mod render;
@@ -36,10 +31,14 @@ use crate::render::widgets::{self, ExpandedTab, HitContext, HitTarget};
 use crate::services::audio_viz::AudioVisualizer;
 use crate::services::media::{MediaInfo, MediaService};
 use crate::services::notifications::{NotificationService, NotificationSnapshot};
+use crate::services::pomodoro::PomodoroTimer;
+use crate::services::sysmon::SystemMonitor;
 use crate::services::system::{SystemService, SystemSnapshot};
 
 const FRAME_MS: u64 = 16;
 const FRAME_SECONDS: f32 = 0.016;
+const MAX_CLIP_ITEMS: usize = 6;
+const MAX_CLIP_CHARS: usize = 2000;
 
 struct AppState {
     window: ApplicationWindow,
@@ -53,6 +52,11 @@ struct AppState {
     system_snapshot: SystemSnapshot,
     notifications: NotificationService,
     notification_snapshot: NotificationSnapshot,
+    timer: PomodoroTimer,
+    clip_items: Vec<String>,
+    clip_copied_flash_until: Option<Instant>,
+    ignore_next_clip: bool,
+    sysmon: SystemMonitor,
     last_clock_minute: (u32, u32),
     last_input_rect: Option<(i32, i32, i32, i32)>,
     expanded: bool,
@@ -75,6 +79,7 @@ impl AppState {
             hud_visible: self.hud_visible(),
             toast_visible: self.toast_visible(),
             notifications: &self.notification_snapshot,
+            clip_count: self.clip_items.len(),
         }
     }
 
@@ -84,6 +89,12 @@ impl AppState {
 
     fn toast_visible(&self) -> bool {
         self.notification_snapshot.is_toast_visible(Instant::now())
+    }
+
+    fn clip_flash_active(&self) -> bool {
+        self.clip_copied_flash_until
+            .map(|t| Instant::now() < t)
+            .unwrap_or(false)
     }
 
     fn equalizer_active(&self) -> bool {
@@ -132,10 +143,7 @@ impl AppState {
         let mode = if self.hud_visible() {
             PillMode::Hud
         } else if self.expanded {
-            match self.expanded_tab {
-                ExpandedTab::Media => PillMode::Expanded,
-                ExpandedTab::Notifications => PillMode::ExpandedNotifications,
-            }
+            PillMode::Expanded
         } else if self.toast_visible() {
             PillMode::Notification
         } else if self.notification_snapshot.unread_count() > 0 {
@@ -152,12 +160,9 @@ impl AppState {
         }
         self.expanded = expanded;
         if expanded {
-            self.expanded_tab =
-                if !self.media_info.has_session && self.notification_snapshot.unread_count() > 0 {
-                    ExpandedTab::Notifications
-                } else {
-                    ExpandedTab::Media
-                };
+            if self.expanded_tab == ExpandedTab::System {
+                self.sysmon.sample();
+            }
         } else {
             self.hovered_target = None;
         }
@@ -170,8 +175,25 @@ impl AppState {
         }
         self.expanded_tab = tab;
         self.hovered_target = None;
+        if tab == ExpandedTab::System {
+            self.sysmon.sample();
+        }
         self.apply_pill_mode();
         self.area.queue_draw();
+    }
+
+    fn push_clip_text(&mut self, raw: &str) -> bool {
+        let normalized: String = raw.trim().chars().take(MAX_CLIP_CHARS).collect();
+        if normalized.is_empty() {
+            return false;
+        }
+        if self.clip_items.first().map(|s| s.as_str()) == Some(normalized.as_str()) {
+            return false;
+        }
+        self.clip_items.retain(|existing| existing != &normalized);
+        self.clip_items.insert(0, normalized);
+        self.clip_items.truncate(MAX_CLIP_ITEMS);
+        true
     }
 }
 
@@ -323,7 +345,6 @@ fn toggle_autostart() {
 }
 
 fn build_ui(app: &Application) {
-    // Load transparent window CSS
     let provider = CssProvider::new();
     provider.load_from_data(
         "window.zekrima-window, window.zekrima-window > * { background-color: transparent; background-image: none; box-shadow: none; }",
@@ -346,7 +367,6 @@ fn build_ui(app: &Application) {
         .build();
     window.add_css_class("zekrima-window");
 
-    // Native Wayland Layer Shell (Hyprland, Sway, KDE Plasma 6 Wayland, Niri, Wayfire)
     if gtk4_layer_shell::is_supported() {
         window.init_layer_shell();
         window.set_namespace(Some("zekrima"));
@@ -361,8 +381,6 @@ fn build_ui(app: &Application) {
     area.set_content_height(CANVAS_HEIGHT_LOGICAL as i32);
     window.set_child(Some(&area));
 
-    // Background worker threads wake the GTK main loop instantaneously via
-    // `MainContext::default().invoke`, avoiding any polling.
     let media_wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {
         glib::MainContext::default().invoke(|| {
             APP_HANDLE.with(|cell| {
@@ -423,6 +441,8 @@ fn build_ui(app: &Application) {
     let system_snapshot = system.snapshot();
     let notifications = NotificationService::start(notif_wake);
     let notification_snapshot = notifications.snapshot();
+    let mut sysmon = SystemMonitor::new();
+    sysmon.sample();
 
     let now_local = Local::now();
     let state = Rc::new(RefCell::new(AppState {
@@ -437,6 +457,11 @@ fn build_ui(app: &Application) {
         system_snapshot,
         notifications,
         notification_snapshot,
+        timer: PomodoroTimer::default(),
+        clip_items: Vec::with_capacity(MAX_CLIP_ITEMS),
+        clip_copied_flash_until: None,
+        ignore_next_clip: false,
+        sysmon,
         last_clock_minute: (now_local.hour(), now_local.minute()),
         last_input_rect: None,
         expanded: false,
@@ -452,6 +477,33 @@ fn build_ui(app: &Application) {
         *cell.borrow_mut() = Some(Rc::downgrade(&state));
     });
 
+    // Event-driven GTK4 Clipboard watcher (zero polling)
+    if let Some(display) = gdk::Display::default() {
+        let clipboard = display.clipboard();
+        let weak = Rc::downgrade(&state);
+        clipboard.connect_changed(move |cb| {
+            let weak_inner = weak.clone();
+            cb.read_text_async(None::<&gio::Cancellable>, move |res| {
+                let Ok(Some(text)) = res else { return };
+                let Some(rc) = weak_inner.upgrade() else {
+                    return;
+                };
+                let mut st = rc.borrow_mut();
+                if st.ignore_next_clip {
+                    st.ignore_next_clip = false;
+                    return;
+                }
+                if st.push_clip_text(&text)
+                    && st.expanded
+                    && st.expanded_tab == ExpandedTab::Clipboard
+                    && !st.anim_running
+                {
+                    st.area.queue_draw();
+                }
+            });
+        });
+    }
+
     // Draw function
     {
         let st_rc = Rc::clone(&state);
@@ -465,6 +517,10 @@ fn build_ui(app: &Application) {
             let media = st.media_info.clone();
             let system = st.system_snapshot.clone();
             let notification = st.notification_snapshot.clone();
+            let timer = st.timer.clone();
+            let clip_items = st.clip_items.clone();
+            let clip_copied_flash = st.clip_flash_active();
+            let sys_stats = st.sysmon.stats.clone();
 
             let frame = Frame {
                 width,
@@ -477,12 +533,15 @@ fn build_ui(app: &Application) {
                 eq_levels,
                 system: &system,
                 notification: &notification,
+                timer: &timer,
+                clip_items: &clip_items,
+                clip_copied_flash,
+                sys_stats: &sys_stats,
             };
             st.renderer.draw(cr, &frame);
         });
     }
 
-    // Apply click-through input region as soon as the GDK surface is realized
     {
         let st_rc = Rc::clone(&state);
         window.connect_realize(move |_| {
@@ -548,15 +607,31 @@ fn build_ui(app: &Application) {
 
                 if let Some(target) = target {
                     match target {
+                        HitTarget::SelectTab(tab) => st.set_expanded_tab(tab),
                         HitTarget::MediaControl(c) => st.media.control(c),
                         HitTarget::ToastDismiss(id) => st.notifications.dismiss(id),
                         HitTarget::ToastClear(_) => st.notifications.clear_toast(),
-                        HitTarget::TabMedia => st.set_expanded_tab(ExpandedTab::Media),
-                        HitTarget::TabNotifications => {
-                            st.set_expanded_tab(ExpandedTab::Notifications)
-                        }
                         HitTarget::ClearAllNotifications => st.notifications.clear_all(),
                         HitTarget::NotifDismiss(id) => st.notifications.dismiss(id),
+                        HitTarget::TimerToggle => st.timer.toggle_start_pause(),
+                        HitTarget::TimerReset => st.timer.reset(),
+                        HitTarget::TimerPreset(secs) => st.timer.select_preset(secs),
+                        HitTarget::ClipCopy(idx) => {
+                            if let Some(text) = st.clip_items.get(idx).cloned() {
+                                if let Some(display) = gdk::Display::default() {
+                                    st.ignore_next_clip = true;
+                                    display.clipboard().set_text(&text);
+                                    st.clip_items.remove(idx);
+                                    st.clip_items.insert(0, text);
+                                    st.clip_copied_flash_until =
+                                        Some(Instant::now() + Duration::from_millis(1400));
+                                }
+                            }
+                        }
+                        HitTarget::ClipClear => {
+                            st.clip_items.clear();
+                            st.clip_copied_flash_until = None;
+                        }
                     }
                 } else if st.toast_visible() && !st.expanded {
                     st.notifications.clear_toast();
@@ -571,7 +646,7 @@ fn build_ui(app: &Application) {
     }
     area.add_controller(left_click);
 
-    // Right-click context menu (Autostart, Test Notification, Quit)
+    // Right-click menu
     let action_group = gio::SimpleActionGroup::new();
     {
         let act = gio::SimpleAction::new("toggle-autostart", None);
@@ -622,7 +697,7 @@ fn build_ui(app: &Application) {
     }
     area.add_controller(right_click);
 
-    // 1-second minute-change clock check (zero work unless minute flipped)
+    // 1-second housekeeping: minute clock rollover, Pomodoro tick, on-demand SysMon
     {
         let weak = Rc::downgrade(&state);
         glib::timeout_add_local(Duration::from_secs(1), move || {
@@ -630,13 +705,44 @@ fn build_ui(app: &Application) {
                 return ControlFlow::Break;
             };
             let mut st = rc.borrow_mut();
+            let mut needs_draw = false;
+
             let now = Local::now();
             let cur = (now.hour(), now.minute());
             if cur != st.last_clock_minute {
                 st.last_clock_minute = cur;
-                if !st.anim_running {
-                    st.area.queue_draw();
+                needs_draw = true;
+            }
+
+            if st.timer.running {
+                let finished = st.timer.tick();
+                needs_draw = true;
+                if finished {
+                    st.apply_pill_mode();
+                    st.notifications.push_manual(
+                        "Pomodoro",
+                        "Focus Session Complete!",
+                        "Time's up — take a short break.",
+                    );
                 }
+            }
+
+            if st.expanded && st.expanded_tab == ExpandedTab::System {
+                st.sysmon.sample();
+                needs_draw = true;
+            }
+
+            if st.expanded
+                && st.expanded_tab == ExpandedTab::Clipboard
+                && st.clip_copied_flash_until.is_some()
+                && !st.clip_flash_active()
+            {
+                st.clip_copied_flash_until = None;
+                needs_draw = true;
+            }
+
+            if needs_draw && !st.anim_running {
+                st.area.queue_draw();
             }
             ControlFlow::Continue
         });

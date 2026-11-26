@@ -86,6 +86,14 @@ Atau cari **Zekrima** di Application Launcher (KDE Kickoff / Rofi / Wofi / Fuzze
 | **Klik di luar area pill** | Klik tembus (*click-through*) via `GdkSurface::set_input_region`. |
 | **Klik kanan pada pill** | Menu konteks: `Run at Login`, `Test Notification`, `Quit Zekrima`. |
 
+### 5 Tab Produktivitas (Mode Expanded)
+Saat pill mengembang (`440 × 162`), tersedia 5 tab di bagian atas:
+- **`Media`**: kontrol musik MPRIS2 (album art, judul/artis, Previous/Play-Pause/Next, visualizer PipeWire FFT, jam) atau jam besar + volume saat idle.
+- **`Timer`**: Focus / Pomodoro Timer dengan preset **`5m`**, **`15m`**, **`25m`**, **`45m`**, tombol **`Start`/`Pause`** & **`Reset`**, progress bar, indikator countdown di collapsed pill, serta toast notifikasi otomatis saat waktu habis.
+- **`Clip`**: riwayat teks clipboard (`Ctrl+C`) event-driven via GTK4 `gdk::Clipboard`. Klik baris mana saja untuk copy ulang secara instan, atau klik **`Clear`**.
+- **`Sys`**: System Monitor ringkas (**CPU %** dari `/proc/stat`, **Memory** dari `/proc/meminfo`, **Battery/Power** dari `/sys/class/power_supply`) — hanya di-sample saat tab `Sys` dibuka (`0.0%` idle CPU).
+- **`Notifs`**: daftar notifikasi D-Bus bergaya Pillar.
+
 ### Jam Tegas & Jelas
 - **Collapsed Pill**: jam **`HH:MM`** berukuran **`16.5px` Bold** putih terang di sebelah label Zekrima / album art.
 - **Expanded Idle Card**: jam besar **`32px` Bold** + tanggal singkat (`Thu, 26 Nov`) + level volume sistem.

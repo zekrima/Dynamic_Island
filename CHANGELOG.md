@@ -2,6 +2,19 @@
 
 All notable changes to **Zekrima** will be documented in this file.
 
+## [0.2.0] - 2026-11-26
+
+### Added (Windows & Arch Linux / CachyOS)
+- **Unified 5-Tab Expanded Island**: `Media` | `Timer` | `Clip` | `Sys` | `Notifs` bar across the top of the expanded pill (`440 × 162`).
+- **Focus / Pomodoro Timer (`Timer` tab)**:
+  - Presets (`5m`, `15m`, `25m`, `45m`), `Start`/`Pause`, `Reset`, bottom progress bar, live countdown indicator right in the collapsed pill while running, and automatic Pillar-style completion toast at `00:00`.
+- **Quick Clipboard History (`Clip` tab)**:
+  - Event-driven clipboard watcher (`AddClipboardFormatListener` / `WM_CLIPBOARDUPDATE` on Windows, native GTK4 `gdk::Clipboard::connect_changed` on Arch Linux/CachyOS) with 0% idle polling.
+  - Remembers recent text snippets; click any row to re-copy immediately with green `"Copied to clipboard!"` feedback, plus `Clear` button.
+- **Compact System Monitor (`Sys` tab)**:
+  - Live **CPU %**, **Memory (Used / Total GB & %)**, and **Battery / AC Power** with color-coded bars (green / amber / red).
+  - Sampled strictly on-demand while the `Sys` tab is open (`GetSystemTimes` / `GlobalMemoryStatusEx` / `GetSystemPowerStatus` on Windows; `/proc/stat`, `/proc/meminfo`, `/sys/class/power_supply` on Linux) — `0.0%` idle CPU when closed.
+
 ## [0.1.0] - 2026-11-26
 
 ### Added
