@@ -1,0 +1,19 @@
+[package]
+name = "zekrima"
+version = "0.1.0"
+edition = "2021"
+description = "Zekrima - native Dynamic Island overlay for Arch Linux / CachyOS"
+publish = false
+
+[dependencies]
+gtk4 = "0.11"
+gtk4-layer-shell = "0.8"
+pangocairo = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

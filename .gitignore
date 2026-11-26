@@ -1,0 +1,36 @@
+# Rust build artifacts
+**/target/
+**/*.rs.bk
+**/*.pdb
+
+# Local binaries & distribution archives (published via GitHub Releases)
+dist/
+zekrima-windows/bin/
+*.exe
+*.zip
+*.tar.gz
+*.pkg.tar.zst
+*.pkg.tar.xz
+
+# Arch Linux makepkg temporary outputs
+zekrima-arch-linux/pkg/
+
+# Local reference repositories & scratch notes
+coucou-main/
+Dynamic-Island-for-Windows-main/
+DynamicNotch-main/
+pillar-dynamic-island-for-windows-main/
+Agent.md.md
+Cargo.toml.txt
+Fase 1.rs
+fase 2.rs
+fase 3.rs
+New Text Document.txt
+Struktur Folder.txt
+
+# Editor & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

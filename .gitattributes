@@ -1,0 +1,6 @@
+# Preserve Unix LF line endings for Linux scripts, Arch PKGBUILD, and CI workflows
+*.sh text eol=lf
+PKGBUILD text eol=lf
+*.desktop text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

@@ -1,0 +1,141 @@
+//! Top-level layered "island" host window.
+//!
+//! The window itself is a fixed 540x180 logical-pixel transparent canvas,
+//! horizontally centered at the top of the primary monitor. It never appears
+//! in Alt+Tab or the taskbar and never activates on click.
+
+use windows::core::{w, Error, Result};
+use windows::Win32::Foundation::{HINSTANCE, HWND};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, GetSystemMetrics, RegisterClassW, SetWindowPos, ShowWindow, CS_HREDRAW,
+    CS_VREDRAW, HWND_TOPMOST, SM_CXSCREEN, SWP_NOACTIVATE, SW_SHOWNOACTIVATE, WNDCLASSW, WNDPROC,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
+
+use crate::layout::canvas_size_px;
+
+pub struct HostWindow {
+    hwnd: HWND,
+    dpi: u32,
+    width_px: u32,
+    height_px: u32,
+}
+
+impl HostWindow {
+    /// Registers the window class and creates the hidden layered canvas.
+    pub unsafe fn create(wndproc: WNDPROC) -> Result<Self> {
+        let module = GetModuleHandleW(None)?;
+        let instance = HINSTANCE(module.0);
+        let class_name = w!("ZekrimaHostWindow");
+
+        let window_class = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: wndproc,
+            hInstance: instance,
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+
+        if RegisterClassW(&window_class) == 0 {
+            return Err(Error::from_win32());
+        }
+
+        let dpi = GetDpiForSystem().max(96);
+        let (width_px, height_px) = canvas_size_px(dpi);
+        let screen_width = GetSystemMetrics(SM_CXSCREEN);
+        let x = (screen_width - width_px) / 2;
+
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class_name,
+            w!("Zekrima"),
+            WS_POPUP,
+            x,
+            0,
+            width_px,
+            height_px,
+            None,
+            None,
+            instance,
+            None,
+        )?;
+
+        let actual_dpi = GetDpiForWindow(hwnd).max(96);
+        let mut host = Self {
+            hwnd,
+            dpi,
+            width_px: width_px as u32,
+            height_px: height_px as u32,
+        };
+
+        if actual_dpi != dpi {
+            host.apply_dpi(actual_dpi)?;
+        }
+
+        Ok(host)
+    }
+
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
+    pub fn dpi(&self) -> u32 {
+        self.dpi
+    }
+
+    pub fn width_px(&self) -> u32 {
+        self.width_px
+    }
+
+    pub fn height_px(&self) -> u32 {
+        self.height_px
+    }
+
+    /// Applies a new DPI, resizes the canvas and re-centers it at `y = 0`.
+    pub unsafe fn apply_dpi(&mut self, dpi: u32) -> Result<()> {
+        let dpi = dpi.max(96);
+        let (width_px, height_px) = canvas_size_px(dpi);
+        let screen_width = GetSystemMetrics(SM_CXSCREEN);
+        let x = (screen_width - width_px) / 2;
+
+        SetWindowPos(
+            self.hwnd,
+            HWND_TOPMOST,
+            x,
+            0,
+            width_px,
+            height_px,
+            SWP_NOACTIVATE,
+        )?;
+
+        self.dpi = dpi;
+        self.width_px = width_px as u32;
+        self.height_px = height_px as u32;
+        Ok(())
+    }
+
+    /// Shows the window without activating it or stealing keyboard focus.
+    pub unsafe fn show(&self) {
+        let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+    }
+
+    /// Re-centers the canvas at the top edge of the primary monitor.
+    pub unsafe fn recenter(&self) -> Result<()> {
+        let screen_width = GetSystemMetrics(SM_CXSCREEN);
+        let x = (screen_width - self.width_px as i32) / 2;
+
+        SetWindowPos(
+            self.hwnd,
+            HWND_TOPMOST,
+            x,
+            0,
+            self.width_px as i32,
+            self.height_px as i32,
+            SWP_NOACTIVATE,
+        )?;
+
+        Ok(())
+    }
+}

@@ -1,0 +1,154 @@
+//! Damped harmonic spring physics used by the island geometry.
+
+pub const COLLAPSED_WIDTH: f32 = 178.0;
+pub const COLLAPSED_BADGE_WIDTH: f32 = 228.0;
+pub const COLLAPSED_HEIGHT: f32 = 34.0;
+pub const COLLAPSED_RADIUS: f32 = 17.0;
+
+pub const HUD_WIDTH: f32 = 300.0;
+pub const HUD_HEIGHT: f32 = 52.0;
+pub const HUD_RADIUS: f32 = 26.0;
+
+pub const NOTIFICATION_WIDTH: f32 = 380.0;
+pub const NOTIFICATION_HEIGHT: f32 = 88.0;
+pub const NOTIFICATION_RADIUS: f32 = 26.0;
+
+pub const EXPANDED_WIDTH: f32 = 440.0;
+pub const EXPANDED_HEIGHT: f32 = 120.0;
+pub const EXPANDED_RADIUS: f32 = 28.0;
+
+pub const EXPANDED_NOTIFS_WIDTH: f32 = 440.0;
+pub const EXPANDED_NOTIFS_HEIGHT: f32 = 162.0;
+pub const EXPANDED_NOTIFS_RADIUS: f32 = 28.0;
+
+const REST_DISTANCE: f32 = 0.05;
+const REST_VELOCITY: f32 = 0.05;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Spring {
+    current: f32,
+    target: f32,
+    velocity: f32,
+    stiffness: f32,
+    damping: f32,
+}
+
+impl Spring {
+    pub fn new(initial: f32) -> Self {
+        Self {
+            current: initial,
+            target: initial,
+            velocity: 0.0,
+            stiffness: 280.0,
+            damping: 26.0,
+        }
+    }
+
+    pub fn set_target(&mut self, target: f32) -> bool {
+        if self.target == target {
+            false
+        } else {
+            self.target = target;
+            true
+        }
+    }
+
+    pub fn update(&mut self, dt: f32) -> bool {
+        let force = (self.target - self.current) * self.stiffness;
+        let damping_force = self.velocity * self.damping;
+
+        self.velocity += (force - damping_force) * dt;
+        self.current += self.velocity * dt;
+
+        if (self.target - self.current).abs() < REST_DISTANCE
+            && self.velocity.abs() < REST_VELOCITY
+        {
+            self.current = self.target;
+            self.velocity = 0.0;
+            false
+        } else {
+            true
+        }
+    }
+
+    pub fn current(&self) -> f32 {
+        self.current
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.current == self.target && self.velocity == 0.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PillMode {
+    Collapsed,
+    CollapsedWithBadge,
+    Hud,
+    Notification,
+    Expanded,
+    ExpandedNotifications,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PillSprings {
+    pub width: Spring,
+    pub height: Spring,
+    pub radius: Spring,
+}
+
+impl PillSprings {
+    pub fn new() -> Self {
+        Self {
+            width: Spring::new(COLLAPSED_WIDTH),
+            height: Spring::new(COLLAPSED_HEIGHT),
+            radius: Spring::new(COLLAPSED_RADIUS),
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: PillMode) -> bool {
+        let (w, h, r) = match mode {
+            PillMode::Collapsed => (COLLAPSED_WIDTH, COLLAPSED_HEIGHT, COLLAPSED_RADIUS),
+            PillMode::CollapsedWithBadge => {
+                (COLLAPSED_BADGE_WIDTH, COLLAPSED_HEIGHT, COLLAPSED_RADIUS)
+            }
+            PillMode::Hud => (HUD_WIDTH, HUD_HEIGHT, HUD_RADIUS),
+            PillMode::Notification => (NOTIFICATION_WIDTH, NOTIFICATION_HEIGHT, NOTIFICATION_RADIUS),
+            PillMode::Expanded => (EXPANDED_WIDTH, EXPANDED_HEIGHT, EXPANDED_RADIUS),
+            PillMode::ExpandedNotifications => (
+                EXPANDED_NOTIFS_WIDTH,
+                EXPANDED_NOTIFS_HEIGHT,
+                EXPANDED_NOTIFS_RADIUS,
+            ),
+        };
+        let w_chg = self.width.set_target(w);
+        let h_chg = self.height.set_target(h);
+        let r_chg = self.radius.set_target(r);
+        w_chg || h_chg || r_chg
+    }
+
+    pub fn update(&mut self, dt: f32) -> bool {
+        let w = self.width.update(dt);
+        let h = self.height.update(dt);
+        let r = self.radius.update(dt);
+        w || h || r
+    }
+
+    pub fn geometry(&self) -> (f32, f32, f32) {
+        (
+            self.width.current(),
+            self.height.current(),
+            self.radius.current(),
+        )
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.width.is_settled() && self.height.is_settled() && self.radius.is_settled()
+    }
+}
+
+impl Default for PillSprings {
+    fn default() -> Self {
+        Self::new()
+    }
+}

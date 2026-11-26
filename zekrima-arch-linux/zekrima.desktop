@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Zekrima
+Comment=Native Dynamic Island Overlay for Arch Linux / CachyOS
+Exec=/usr/bin/zekrima
+Terminal=false
+Categories=Utility;DesktopUtility;
+StartupNotify=false

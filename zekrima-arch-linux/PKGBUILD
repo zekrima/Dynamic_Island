@@ -1,0 +1,37 @@
+# Maintainer: Zekrima
+pkgname=zekrima
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native Dynamic Island overlay for Arch Linux / CachyOS (GTK4 + Wayland Layer Shell)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/zekrima/Dynamic_Island"
+license=('MIT')
+depends=(
+  'gtk4'
+  'gtk4-layer-shell'
+  'pango'
+  'cairo'
+  'gdk-pixbuf2'
+  'playerctl'
+  'pipewire-pulse'
+  'wireplumber'
+  'dbus'
+  'curl'
+)
+makedepends=(
+  'cargo'
+  'rust'
+  'pkgconf'
+)
+
+build() {
+  cd "$startdir"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo build --release --locked 2>/dev/null || cargo build --release
+}
+
+package() {
+  cd "$startdir"
+  install -Dm755 "target/release/zekrima" "$pkgdir/usr/bin/zekrima"
+  install -Dm644 "zekrima.desktop" "$pkgdir/usr/share/applications/zekrima.desktop"
+}
